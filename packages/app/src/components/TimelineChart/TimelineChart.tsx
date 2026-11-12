@@ -68,6 +68,7 @@ type TimelineChartProps = {
   maxHeight: number;
   rowHeight: number;
   rows: Row[];
+  renderRow?: (row: Row, index: number) => Row;
   onEventClick: (e: Row) => void;
   onReady?: (controller: TimelineViewportController) => void;
 };
@@ -92,6 +93,7 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
     maxHeight,
     rowHeight,
     rows,
+    renderRow,
     onEventClick,
     onReady,
   } = props;
@@ -399,9 +401,8 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
 
   const handleRowClick = useStableCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      const id = e.currentTarget.dataset.id;
-      if (id == null) return;
-      const row = rows.find(r => r.id === id);
+      const index = Number(e.currentTarget.dataset.index);
+      const row = rows[index];
       if (row == null) return;
       onEventClick(row);
     },
@@ -450,7 +451,8 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
             </div>
 
             {rowVirtualizer.getVirtualItems().map(virtualRow => {
-              const row = rows[virtualRow.index];
+              const sourceRow = rows[virtualRow.index];
+              const row = renderRow?.(sourceRow, virtualRow.index) ?? sourceRow;
               const top = virtualRow.start + axisHeight + rowsMarginTop;
 
               return (

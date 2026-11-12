@@ -58,11 +58,17 @@ jest.mock('@/components/TimelineChart', () => {
   };
 
   const mockComponent = function MockTimelineChart(props: any) {
-    mockComponent.latestProps = props;
+    const renderedProps = {
+      ...props,
+      rows: props.rows.map(
+        (row: any, index: number) => props.renderRow?.(row, index) ?? row,
+      ),
+    };
+    mockComponent.latestProps = renderedProps;
     return (
       <div data-testid="timeline-chart">
         TimelineChart
-        {props.rows?.map((row: any) => (
+        {renderedProps.rows?.map((row: any) => (
           <div key={row.id}>
             {row.events?.map((event: any) => flattenText(event.body))}
           </div>

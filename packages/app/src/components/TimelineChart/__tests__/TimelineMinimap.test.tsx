@@ -8,8 +8,23 @@ import { TimelineMinimap } from '@/components/TimelineChart/TimelineMinimap';
 // box and stub pointer capture so getXFraction math is deterministic
 // (clientX / 1000 = fraction).
 const CONTAINER_WIDTH = 1000;
+const fillRect = jest.fn();
+const clearRect = jest.fn();
+const setTransform = jest.fn();
+const paintedColors: string[] = [];
 
 beforeAll(() => {
+  jest.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+    () =>
+      ({
+        clearRect,
+        setTransform,
+        fillRect,
+        set fillStyle(value: string) {
+          paintedColors.push(value);
+        },
+      }) as unknown as CanvasRenderingContext2D,
+  );
   // jsdom doesn't implement PointerEvent, so fireEvent.pointerXxx would drop
   // clientX. Back it with MouseEvent (which honors clientX from init).
   if (typeof window.PointerEvent === 'undefined') {
@@ -33,6 +48,12 @@ beforeAll(() => {
     y: 0,
     toJSON: () => ({}),
   } as DOMRect);
+});
+
+beforeEach(() => {
+  fillRect.mockClear();
+  clearRect.mockClear();
+  paintedColors.length = 0;
 });
 
 afterAll(() => {
@@ -88,14 +109,39 @@ describe('TimelineMinimap', () => {
       viewportWidthFrac: 1,
     });
     renderWithMantine(<TimelineMinimap rows={rows} controller={controller} />);
-    const minimap = screen.getByTestId('timeline-minimap');
-    const bars = Array.from(minimap.querySelectorAll('div')).filter(el =>
-      /rgb\(/.test(el.style.backgroundColor),
-    );
-    expect(bars.length).toBe(2);
-    expect(bars.map(b => b.style.backgroundColor)).toEqual(
+    expect(fillRect).toHaveBeenCalledTimes(2);
+    expect(paintedColors).toEqual(
       expect.arrayContaining(['rgb(10, 20, 30)', 'rgb(40, 50, 60)']),
     );
+  });
+
+  it('draws all 200,000 spans on one canvas and keeps bars stable while zooming', () => {
+    const largeRows = Array.from({ length: 200_000 }, (_, i) => ({
+      events: [{ ...rows[0].events[0], id: String(i), start: i, end: i + 1 }],
+    }));
+    const controller = makeController({
+      scale: 1,
+      offsetFrac: 0,
+      viewportWidthFrac: 1,
+    });
+    renderWithMantine(
+      <TimelineMinimap rows={largeRows} controller={controller} />,
+    );
+    const minimap = screen.getByTestId('timeline-minimap');
+    expect(minimap.querySelectorAll('canvas')).toHaveLength(1);
+    expect(minimap.querySelectorAll('div').length).toBeLessThan(20);
+    expect(fillRect).toHaveBeenCalledTimes(200_000);
+    expect(fillRect).toHaveBeenLastCalledWith(
+      expect.closeTo((199_999 / 220_000) * 1000, 6),
+      48,
+      1.5,
+      2,
+    );
+    fireEvent.pointerDown(minimap, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(minimap, { clientX: 600, pointerId: 1 });
+    fireEvent.pointerUp(minimap, { pointerId: 1 });
+    expect(controller.zoomToRange).toHaveBeenCalledWith(0.1, 0.6);
+    expect(fillRect).toHaveBeenCalledTimes(200_000);
   });
 
   it('hides viewport chrome (reset button) when fully zoomed out', () => {
