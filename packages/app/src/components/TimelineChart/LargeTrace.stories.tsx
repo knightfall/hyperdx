@@ -12,6 +12,7 @@ import {
   flattenWaterfallTree,
 } from '@/components/traceWaterfallData';
 import {
+  getWaterfallTimelineRow,
   getWaterfallTimelineRows,
   type WaterfallRow,
 } from '@/components/traceWaterfallModel';
@@ -61,6 +62,20 @@ function LargeTrace({ spanCount }: { spanCount: number }) {
     () => getWaterfallTimelineRows(visible, START, SERVICE_COLORS),
     [visible],
   );
+  const highlightedRow = useMemo(() => {
+    const index = visible.findIndex(row => row.id === selected);
+    return index < 0
+      ? undefined
+      : {
+          ...getWaterfallTimelineRow(
+            visible[index],
+            START,
+            SERVICE_COLORS,
+            true,
+          ),
+          index,
+        };
+  }, [selected, visible]);
   const onClick = useCallback(({ id }: { id: string }) => setSelected(id), []);
   const toggleCollapse = useCallback(
     (id: string, event: React.MouseEvent) => {
@@ -113,7 +128,11 @@ function LargeTrace({ spanCount }: { spanCount: number }) {
         </Button>
         <Text role="status">Selected: {selected ?? 'none'}</Text>
       </Group>
-      <TimelineMinimap rows={rows} controller={controller} />
+      <TimelineMinimap
+        rows={rows}
+        controller={controller}
+        highlightedRow={highlightedRow}
+      />
       <TimelineChart
         initialScrollRowIndex={-1}
         labelWidth={400}

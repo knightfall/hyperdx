@@ -81,6 +81,7 @@ import {
 } from './traceWaterfallData';
 import {
   getRowSeverity,
+  getWaterfallTimelineRow,
   getWaterfallTimelineRows,
   type WaterfallRow,
 } from './traceWaterfallModel';
@@ -325,11 +326,13 @@ export function useEventsData({
   dateRangeStartInclusive,
   dateRange,
   enabled,
+  enableStreaming = true,
 }: {
   config: ChartConfig;
   dateRangeStartInclusive: boolean;
   dateRange: [Date, Date];
   enabled: boolean;
+  enableStreaming?: boolean;
 }) {
   const query: ChartConfigWithDateRange = useMemo(() => {
     return {
@@ -338,7 +341,7 @@ export function useEventsData({
       dateRangeStartInclusive,
     };
   }, [config, dateRange, dateRangeStartInclusive]);
-  return useOffsetPaginatedQuery(query, { enabled });
+  return useOffsetPaginatedQuery(query, { enabled, enableStreaming });
 }
 
 export function useEventsAroundFocus({
@@ -388,6 +391,7 @@ export function useEventsAroundFocus({
     dateRangeStartInclusive: true,
     dateRange: [dateRange[0], focusDate],
     enabled,
+    enableStreaming: false,
   });
 
   const {
@@ -399,6 +403,7 @@ export function useEventsAroundFocus({
     dateRangeStartInclusive: false,
     dateRange: [focusDate, dateRange[1]],
     enabled,
+    enableStreaming: false,
   });
 
   const isFetching = isBeforeSpanFetching || isAfterSpanFetching;
@@ -872,7 +877,7 @@ export function DBTraceWaterfallChartContainer({
       row => !row.__hdx_hidden,
     );
 
-    const attributes = getHighlightedAttributesFromData(
+    let attributes = getHighlightedAttributesFromData(
       traceTableSource,
       traceTableSource.highlightedTraceAttributeExpressions,
       visibleTraceRowsData,
@@ -882,8 +887,8 @@ export function DBTraceWaterfallChartContainer({
     if (logTableSource && logRowsData && logRowsMeta) {
       const visibleLogRowsData = logRowsData?.filter(row => !row.__hdx_hidden);
 
-      attributes.push(
-        ...getHighlightedAttributesFromData(
+      attributes = attributes.concat(
+        getHighlightedAttributesFromData(
           logTableSource,
           logTableSource.highlightedTraceAttributeExpressions,
           visibleLogRowsData,
@@ -1031,6 +1036,18 @@ export function DBTraceWaterfallChartContainer({
     () => visibleNodes.findIndex(v => v.id === highlightedRowWhere),
     [visibleNodes, highlightedRowWhere],
   );
+  const highlightedMinimapRow = useMemo(() => {
+    if (initialScrollRowIndex < 0) return undefined;
+    return {
+      ...getWaterfallTimelineRow(
+        visibleNodes[initialScrollRowIndex],
+        minOffset,
+        serviceColorMap,
+        true,
+      ),
+      index: initialScrollRowIndex,
+    };
+  }, [initialScrollRowIndex, visibleNodes, minOffset, serviceColorMap]);
 
   const { ref: timelineWrapperRef, height: timelineWrapperHeight } =
     useElementSize();
@@ -1044,7 +1061,11 @@ export function DBTraceWaterfallChartContainer({
   return (
     <>
       {showMinimap && (
-        <TimelineMinimap rows={timelineRows} controller={viewportController} />
+        <TimelineMinimap
+          rows={timelineRows}
+          controller={viewportController}
+          highlightedRow={highlightedMinimapRow}
+        />
       )}
       {isFilterExpanded && (
         <form onSubmit={handleSubmit(onSubmitFilters)}>

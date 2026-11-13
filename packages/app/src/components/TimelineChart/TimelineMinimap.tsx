@@ -7,6 +7,7 @@ import {
   MINIMAP_HEIGHT,
   type MinimapRow,
   TimelineMinimapBars,
+  TimelineMinimapHighlight,
 } from './TimelineMinimapBars';
 import { getMaxEventValue, renderMs } from './utils';
 
@@ -17,6 +18,7 @@ type DragMode = 'pan' | 'resize-left' | 'resize-right' | 'brush' | null;
 type TimelineMinimapProps = {
   rows: MinimapRow[];
   controller: TimelineViewportController | null;
+  highlightedRow?: React.ComponentProps<typeof TimelineMinimapHighlight>['row'];
 };
 
 // Pixel width of the grab zone on each side of the viewport for resize handles.
@@ -49,6 +51,7 @@ const HandleGrip = ({ side }: { side: 'left' | 'right' }) => (
 export const TimelineMinimap = memo(function ({
   rows,
   controller,
+  highlightedRow,
 }: TimelineMinimapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragModeRef = useRef<DragMode>(null);
@@ -272,6 +275,11 @@ export const TimelineMinimap = memo(function ({
       onPointerCancel={handlePointerUp}
     >
       <TimelineMinimapBars rows={rows} maxVal={maxVal} />
+      <TimelineMinimapHighlight
+        row={highlightedRow}
+        rowCount={rows.length}
+        maxVal={maxVal}
+      />
       {ticks.map(({ frac, label }) => (
         <div
           key={frac}

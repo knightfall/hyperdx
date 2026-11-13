@@ -66,32 +66,41 @@ export function getWaterfallTimelineRows(
   minOffset: number,
   serviceColorMap: Map<string, string>,
 ) {
-  return visibleNodes.map(result => {
-    const start = parseTimestampToMs(result.Timestamp) - minOffset;
-    return {
-      id: result.id,
-      type: result.type,
-      aliasWith: result.aliasWith,
-      label: null,
-      events: [
-        {
-          id: result.id,
-          start,
-          end: start + (result.Duration || 0) * 1000,
-          tooltip: '',
-          color: 'var(--color-text-inverted)',
-          backgroundColor: barColor({
-            isHighlighted: false,
-            isError: getRowSeverity(result) === 'error',
-            type: result.type,
-            serviceColor: result.ServiceName
-              ? serviceColorMap.get(result.ServiceName)
-              : undefined,
-          }),
-          body: null,
-          minWidthPx: result.type === SourceKind.Log ? 10 : 2,
-        },
-      ],
-    };
-  });
+  return visibleNodes.map(result =>
+    getWaterfallTimelineRow(result, minOffset, serviceColorMap),
+  );
+}
+
+export function getWaterfallTimelineRow(
+  result: WaterfallNode<WaterfallRow> & { level: number },
+  minOffset: number,
+  serviceColorMap: Map<string, string>,
+  isHighlighted = false,
+) {
+  const start = parseTimestampToMs(result.Timestamp) - minOffset;
+  return {
+    id: result.id,
+    type: result.type,
+    aliasWith: result.aliasWith,
+    label: null,
+    events: [
+      {
+        id: result.id,
+        start,
+        end: start + (result.Duration || 0) * 1000,
+        tooltip: '',
+        color: 'var(--color-text-inverted)',
+        backgroundColor: barColor({
+          isHighlighted,
+          isError: getRowSeverity(result) === 'error',
+          type: result.type,
+          serviceColor: result.ServiceName
+            ? serviceColorMap.get(result.ServiceName)
+            : undefined,
+        }),
+        body: null,
+        minWidthPx: result.type === SourceKind.Log ? 10 : 2,
+      },
+    ],
+  };
 }

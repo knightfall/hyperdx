@@ -12,6 +12,43 @@ export type MinimapRow = {
   events: Pick<TTimelineEvent, 'start' | 'end' | 'backgroundColor'>[];
 };
 
+function getMinimapRowTop(rowIndex: number, rowCount: number) {
+  return (
+    TICK_HEIGHT +
+    2 +
+    Math.round((rowIndex / rowCount) * (BAR_AREA_HEIGHT - BAR_HEIGHT - 4))
+  );
+}
+
+export function TimelineMinimapHighlight({
+  row,
+  rowCount,
+  maxVal,
+}: {
+  row?: MinimapRow & { index: number };
+  rowCount: number;
+  maxVal: number;
+}) {
+  if (!row || row.index < 0 || row.index >= rowCount || maxVal <= 0)
+    return null;
+  return row.events.map((event, index) => (
+    <div
+      key={index}
+      data-testid="timeline-minimap-highlight"
+      style={{
+        position: 'absolute',
+        pointerEvents: 'none',
+        borderRadius: 1,
+        left: `${(event.start / maxVal) * 100}%`,
+        width: `${Math.max(((event.end - event.start) / maxVal) * 100, 0.15)}%`,
+        top: getMinimapRowTop(row.index, rowCount),
+        height: BAR_HEIGHT,
+        backgroundColor: event.backgroundColor,
+      }}
+    />
+  ));
+}
+
 export const TimelineMinimapBars = memo(function TimelineMinimapBars({
   rows,
   maxVal,
@@ -52,12 +89,7 @@ export const TimelineMinimapBars = memo(function TimelineMinimapBars({
       const colors = new Map<string, string>();
       let previousColor: string | undefined;
       for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-        const top =
-          TICK_HEIGHT +
-          2 +
-          Math.round(
-            (rowIndex / rows.length) * (BAR_AREA_HEIGHT - BAR_HEIGHT - 4),
-          );
+        const top = getMinimapRowTop(rowIndex, rows.length);
         for (const event of rows[rowIndex].events) {
           let color = colors.get(event.backgroundColor);
           if (!color) {

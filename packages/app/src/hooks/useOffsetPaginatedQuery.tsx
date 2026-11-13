@@ -54,14 +54,20 @@ type TQueryKey = readonly [
   string,
   ChartConfigWithOptTimestamp,
   number | undefined,
+  false?,
 ];
 
 function queryKeyFn(
   prefix: string,
   config: ChartConfigWithOptTimestamp,
   queryTimeout?: number,
+  enableStreaming = true,
 ): TQueryKey {
-  return [prefix, config, queryTimeout];
+  // Isolate buffered queries so another observer cannot change their streaming
+  // policy. Preserve existing cache keys for callers that stream partial rows.
+  return enableStreaming
+    ? [prefix, config, queryTimeout]
+    : [prefix, config, queryTimeout, false];
 }
 
 // True when two keys describe the same query over a different time range,
@@ -70,6 +76,7 @@ function differsOnlyInDateRange(a: TQueryKey, b: TQueryKey) {
   return (
     a[0] === b[0] &&
     a[2] === b[2] &&
+    a[3] === b[3] &&
     isEqual(omit(a[1], ['dateRange']), omit(b[1], ['dateRange']))
   );
 }
@@ -205,7 +212,8 @@ const queryFn: QueryFunction<TQueryFnData, TQueryKey, TPageParam> = async ({
   // response or if it's a paginated query
   // otherwise we'll flicker the UI with streaming data
   const isStreamingIncrementally =
-    !hasPreviousQueries || pageParam.offset > 0 || pageParam.windowIndex > 0;
+    queryKey[3] !== false &&
+    (!hasPreviousQueries || pageParam.offset > 0 || pageParam.windowIndex > 0);
 
   const queryTimeout = queryKey[2];
   const clickhouseClient = getClickhouseClient({ queryTimeout, attribution });
@@ -339,7 +347,7 @@ const queryFn: QueryFunction<TQueryFnData, TQueryKey, TPageParam> = async ({
     }
 
     if (queryResultMeta.length === 0) {
-      headerRows.push(...value);
+      for (const row of value) headerRows.push(row);
     }
 
     if (queryResultMeta.length > 0 || headerRows.length >= 2) {
@@ -373,7 +381,7 @@ const queryFn: QueryFunction<TQueryFnData, TQueryKey, TPageParam> = async ({
           rowObj[queryResultMeta[j].name] = rowArr[j];
         }
 
-        rowObjs.push(rowObj);
+        if (isStreamingIncrementally) rowObjs.push(rowObj);
         queryResultData.push(rowObj);
       }
 
@@ -485,6 +493,7 @@ export default function useOffsetPaginatedQuery(
     enabled = true,
     queryKeyPrefix = '',
     enableSmallFirstWindow,
+    enableStreaming = true,
   }: {
     isLive?: boolean;
     /** Keep showing the previous result while the same query loads a new date range */
@@ -492,10 +501,17 @@ export default function useOffsetPaginatedQuery(
     enabled?: boolean;
     queryKeyPrefix?: string;
     enableSmallFirstWindow?: boolean;
+    /** Publish partial pages while loading. Disable to return complete pages only. */
+    enableStreaming?: boolean;
   } = {},
 ) {
   const { data: meData, isLoading: isLoadingMe } = api.useMe();
-  const key = queryKeyFn(queryKeyPrefix, config, meData?.team?.queryTimeout);
+  const key = queryKeyFn(
+    queryKeyPrefix,
+    config,
+    meData?.team?.queryTimeout,
+    enableStreaming,
+  );
   const queryClient = useQueryClient();
   const metadata = useMetadataWithSettings();
   const attribution = useQueryAttribution();
@@ -503,8 +519,9 @@ export default function useOffsetPaginatedQuery(
     queryKey: [queryKeyPrefix, omit(config, ['dateRange'])],
   });
   // TODO: Check that the time ranges overlap
-  const hasPreviousQueries =
-    matchedQueries.filter(([_, data]) => data != null).length > 0;
+  const hasPreviousQueries = matchedQueries.some(
+    ([queryKey, data]) => data != null && queryKey[3] === key[3],
+  );
 
   const windowDurationsSeconds = DEFAULT_TIME_WINDOWS_SECONDS.slice();
   if (enableSmallFirstWindow) {

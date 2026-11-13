@@ -165,6 +165,295 @@ describe('useOffsetPaginatedQuery', () => {
     jest.mocked(useMetadataWithSettings).mockReturnValue(mockMetadata as any);
   });
 
+  describe('Buffered waterfall results', () => {
+    it.each([256, 200_000])(
+      'returns 200,000 rows in %s-row chunks without publishing partial pages',
+      async chunkSize => {
+        const publish = jest.spyOn(queryClient, 'setQueryData');
+        let rowIndex = 0;
+        mockReader.read.mockImplementation(async () => {
+          if (rowIndex === 200_000) return { done: true };
+          const value =
+            rowIndex === 0
+              ? [{ json: () => ['SpanId'] }, { json: () => ['String'] }]
+              : [];
+          const end = Math.min(rowIndex + chunkSize, 200_000);
+          while (rowIndex < end) {
+            const id = String(rowIndex++);
+            value.push({ json: () => [id] });
+          }
+          return { done: false, value };
+        });
+        const { result } = renderHook(
+          () =>
+            useOffsetPaginatedQuery(
+              createMockChartConfig({
+                orderBy: 'ServiceName',
+                limit: { limit: 200_001 },
+              }),
+              { enableStreaming: false },
+            ),
+          { wrapper },
+        );
+        await waitFor(() => expect(result.current.isFetching).toBe(false));
+        expect(result.current.data?.data).toHaveLength(200_000);
+        expect(result.current.data?.data[0]).toEqual({ SpanId: '0' });
+        expect(result.current.data?.data.at(-1)).toEqual({ SpanId: '199999' });
+        expect(result.current.data?.meta).toEqual([
+          { name: 'SpanId', type: 'String' },
+        ]);
+        expect(publish).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      { enableStreaming: undefined, partial: [{ SpanId: 'first' }] },
+      { enableStreaming: false, partial: null },
+    ])(
+      'publishes partial data only when streaming is enabled ($enableStreaming)',
+      async ({ enableStreaming, partial }) => {
+        let finish: (chunk: {
+          done: boolean;
+          value?: { json: () => string[] }[];
+        }) => void = () => {
+          throw new Error('Stream not waiting');
+        };
+        mockReader.read
+          .mockResolvedValueOnce({
+            done: false,
+            value: [{ json: () => ['SpanId'] }],
+          })
+          .mockResolvedValueOnce({
+            done: false,
+            value: [{ json: () => ['String'] }, { json: () => ['first'] }],
+          })
+          .mockImplementationOnce(
+            () =>
+              new Promise(resolve => {
+                finish = resolve;
+              }),
+          )
+          .mockResolvedValueOnce({ done: true });
+        const { result } = renderHook(
+          () =>
+            useOffsetPaginatedQuery(
+              createMockChartConfig({ orderBy: 'ServiceName' }),
+              { enableStreaming },
+            ),
+          { wrapper },
+        );
+        await waitFor(() => expect(mockReader.read).toHaveBeenCalledTimes(3));
+        await waitFor(() =>
+          expect(result.current.data?.data ?? null).toEqual(partial),
+        );
+        expect(result.current.isFetching).toBe(true);
+        await act(async () =>
+          finish({ done: false, value: [{ json: () => ['last'] }] }),
+        );
+        await waitFor(() => expect(result.current.isFetching).toBe(false));
+        expect(result.current.data?.data).toEqual([
+          { SpanId: 'first' },
+          { SpanId: 'last' },
+        ]);
+      },
+    );
+
+    it('keeps complete pages when a later buffered page fails', async () => {
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId'] },
+            { json: () => ['String'] },
+            { json: () => ['saved'] },
+          ],
+        })
+        .mockResolvedValueOnce({ done: true });
+      const { result } = renderHook(
+        () =>
+          useOffsetPaginatedQuery(
+            createMockChartConfig({ orderBy: 'ServiceName' }),
+            { enableStreaming: false },
+          ),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.isFetching).toBe(false));
+      mockReader.read.mockRejectedValue(new Error('Stream failed'));
+      await act(async () => {
+        await result.current.fetchNextPage();
+      });
+      await waitFor(() => expect(result.current.isFetching).toBe(false));
+      expect(result.current.isError).toBe(true);
+      expect(result.current.data?.data).toEqual([{ SpanId: 'saved' }]);
+    });
+
+    it('cancels a buffered next page without losing complete pages or publishing its partial rows', async () => {
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId'] },
+            { json: () => ['String'] },
+            { json: () => ['saved'] },
+          ],
+        })
+        .mockResolvedValueOnce({ done: true });
+      const { result } = renderHook(
+        () =>
+          useOffsetPaginatedQuery(
+            createMockChartConfig({ orderBy: 'ServiceName' }),
+            { enableStreaming: false },
+          ),
+        { wrapper },
+      );
+      await waitFor(() =>
+        expect(result.current.data?.data).toEqual([{ SpanId: 'saved' }]),
+      );
+      let finishRead: () => void = () => {
+        throw new Error('Reader not waiting');
+      };
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId'] },
+            { json: () => ['String'] },
+            { json: () => ['partial'] },
+          ],
+        })
+        .mockImplementationOnce(
+          () =>
+            new Promise(resolve => {
+              finishRead = () => resolve({ done: true });
+            }),
+        );
+      act(() => {
+        void result.current.fetchNextPage();
+      });
+      await waitFor(() => expect(mockReader.read).toHaveBeenCalledTimes(4));
+      await act(async () => {
+        await queryClient.cancelQueries();
+        finishRead();
+      });
+      await waitFor(() => expect(result.current.isFetching).toBe(false));
+      expect(result.current.data?.data).toEqual([{ SpanId: 'saved' }]);
+      expect(result.current.isError).toBe(false);
+    });
+
+    it('reuses completed buffered results and accepts an empty final page', async () => {
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [{ json: () => ['SpanId'] }, { json: () => ['String'] }],
+        })
+        .mockResolvedValueOnce({ done: true });
+      const config = createMockChartConfig({ orderBy: 'ServiceName' });
+      const first = renderHook(
+        () => useOffsetPaginatedQuery(config, { enableStreaming: false }),
+        { wrapper },
+      );
+      await waitFor(() => expect(first.result.current.isFetching).toBe(false));
+      expect(first.result.current.data?.data).toEqual([]);
+      expect(first.result.current.hasNextPage).toBe(false);
+      first.unmount();
+      const second = renderHook(
+        () => useOffsetPaginatedQuery(config, { enableStreaming: false }),
+        { wrapper },
+      );
+      expect(second.result.current.data?.data).toEqual([]);
+      expect(second.result.current.isFetching).toBe(false);
+      expect(mockClickhouseClient.query).toHaveBeenCalledTimes(1);
+    });
+
+    it('isolates buffered and streaming consumers of the same query', async () => {
+      mockClickhouseClient.query.mockImplementation(async () => ({
+        stream: () => ({
+          getReader: () => ({
+            read: jest
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: [
+                  { json: () => ['SpanId'] },
+                  { json: () => ['String'] },
+                  { json: () => ['row'] },
+                ],
+              })
+              .mockResolvedValueOnce({ done: true }),
+          }),
+        }),
+      }));
+      const config = createMockChartConfig({ orderBy: 'ServiceName' });
+      const { result } = renderHook(
+        () => ({
+          streaming: useOffsetPaginatedQuery(config),
+          buffered: useOffsetPaginatedQuery(config, { enableStreaming: false }),
+        }),
+        { wrapper },
+      );
+      await waitFor(() => {
+        expect(result.current.streaming.isFetching).toBe(false);
+        expect(result.current.buffered.isFetching).toBe(false);
+      });
+      expect(result.current.streaming.data?.data).toEqual([{ SpanId: 'row' }]);
+      expect(result.current.buffered.data?.data).toEqual([{ SpanId: 'row' }]);
+      expect(mockClickhouseClient.query).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps default streaming enabled after a buffered result was cached', async () => {
+      const config = createMockChartConfig({ orderBy: 'ServiceName' });
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId'] },
+            { json: () => ['String'] },
+            { json: () => ['cached'] },
+          ],
+        })
+        .mockResolvedValueOnce({ done: true });
+      const buffered = renderHook(
+        () => useOffsetPaginatedQuery(config, { enableStreaming: false }),
+        { wrapper },
+      );
+      await waitFor(() =>
+        expect(buffered.result.current.isFetching).toBe(false),
+      );
+      buffered.unmount();
+      let finishRead: () => void = () => {
+        throw new Error('Reader not waiting');
+      };
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId'] },
+            { json: () => ['String'] },
+            { json: () => ['partial'] },
+          ],
+        })
+        .mockImplementationOnce(
+          () =>
+            new Promise(resolve => {
+              finishRead = () => resolve({ done: true });
+            }),
+        );
+      const streaming = renderHook(() => useOffsetPaginatedQuery(config), {
+        wrapper,
+      });
+      await waitFor(() =>
+        expect(streaming.result.current.data?.data).toEqual([
+          { SpanId: 'partial' },
+        ]),
+      );
+      expect(streaming.result.current.isFetching).toBe(true);
+      await act(async () => finishRead());
+      await waitFor(() =>
+        expect(streaming.result.current.isFetching).toBe(false),
+      );
+    });
+  });
+
   describe('Time Window Generation', () => {
     it('should generate correct time windows for 24-hour range', async () => {
       const config = createMockChartConfig({

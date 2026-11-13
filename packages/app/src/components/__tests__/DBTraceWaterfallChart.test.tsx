@@ -19,8 +19,9 @@ import {
   SpanRow,
   TraceTotalDurationStat,
   useEventsAroundFocus,
+  useEventsData,
 } from '@/components/DBTraceWaterfallChart';
-import { TimelineChart } from '@/components/TimelineChart';
+import { TimelineChart, TimelineMinimap } from '@/components/TimelineChart';
 import { TRACE_WATERFALL_ROW_LIMIT } from '@/components/traceWaterfallLimits';
 import {
   TraceTriggerRow,
@@ -30,6 +31,7 @@ import { useColumns } from '@/hooks/useMetadata';
 import useOffsetPaginatedQuery from '@/hooks/useOffsetPaginatedQuery';
 import useRowWhere from '@/hooks/useRowWhere';
 import { getChartColorError, getChartColorSuccess } from '@/utils';
+import * as highlightedAttributes from '@/utils/highlightedAttributes';
 
 // Mock setup
 jest.mock('@/components/traceWaterfallLimits', () => ({
@@ -141,6 +143,7 @@ const mockUseOffsetPaginatedQuery = useOffsetPaginatedQuery as jest.Mock;
 const mockUseRowWhere = useRowWhere as jest.Mock;
 const mockUseColumns = useColumns as jest.Mock;
 const MockTimelineChart = TimelineChart as any;
+const MockTimelineMinimap = TimelineMinimap as any;
 
 // Mirrors useColumns, which is disabled, so never loading, without a table.
 const setupColumnsMock = (state: { data?: object[]; isLoading?: boolean }) =>
@@ -359,6 +362,99 @@ describe('DBTraceWaterfallChartContainer', () => {
     expect(MockTimelineChart.latestProps.rows.length).toBe(2);
     expect(MockTimelineChart.latestProps.rows[0]).toBeTruthy(); // Trace row
     expect(MockTimelineChart.latestProps.rows[1]).toBeTruthy(); // Log row
+  });
+
+  it('merges 200,000 correlated-log highlights without overflowing the argument stack', async () => {
+    const logHighlights = Array.from({ length: 200_000 }, (_, i) => ({
+      displayedKey: 'EventId',
+      value: String(i).padStart(6, '0'),
+      sql: 'EventId',
+      lucene: undefined,
+      source: mockLogTableSource,
+    }));
+    const extract = jest
+      .spyOn(highlightedAttributes, 'getHighlightedAttributesFromData')
+      .mockImplementation(source =>
+        source.kind === SourceKind.Log
+          ? logHighlights
+          : [
+              {
+                displayedKey: 'Application',
+                value: 'api',
+                sql: 'Application',
+                lucene: undefined,
+                source: mockTraceTableSource,
+              },
+            ],
+      );
+    try {
+      setupQueryMocks({ traceData: mockTraceData, logData: mockLogData });
+      renderComponent();
+      await waitForLoading();
+      expect(screen.getByText('Application: api')).toBeInTheDocument();
+      expect(screen.getByText('EventId: 000000')).toBeInTheDocument();
+      expect(screen.getByText('Show 199989 More...')).toBeInTheDocument();
+    } finally {
+      extract.mockRestore();
+    }
+  });
+
+  it('updates and clears the minimap selection without rebuilding its base rows', async () => {
+    setupQueryMocks({ traceData: mockTraceData });
+    const view = renderComponent(null, mockTraceId, {
+      highlightedRowWhere: 'row-id',
+    });
+    await waitForLoading();
+    const baseRows = MockTimelineMinimap.latestProps.rows;
+    expect(MockTimelineMinimap.latestProps.highlightedRow).toMatchObject({
+      index: 0,
+      events: [
+        {
+          backgroundColor:
+            MockTimelineChart.latestProps.rows[0].events[0].backgroundColor,
+        },
+      ],
+    });
+    view.rerender(
+      <TestProviders>
+        <RowSidePanelContext value={{}}>
+          <DBTraceWaterfallChartContainer
+            traceTableSource={mockTraceTableSource}
+            logTableSource={null}
+            traceId={mockTraceId}
+            dateRange={mockDateRange}
+            focusDate={mockFocusDate}
+            highlightedRowWhere="missing-row"
+          />
+        </RowSidePanelContext>
+      </TestProviders>,
+    );
+    expect(MockTimelineMinimap.latestProps.highlightedRow).toBeUndefined();
+    expect(MockTimelineMinimap.latestProps.rows).toBe(baseRows);
+  });
+
+  it('removes a collapsed child highlight and restores it when expanded', async () => {
+    mockUseRowWhere.mockReturnValue((row: { SpanId: string }) => ({
+      where: row.SpanId,
+      aliasWith: [],
+    }));
+    setupQueryMocks({
+      traceData: {
+        ...mockTraceData,
+        data: [
+          { ...mockTraceData.data[0], SpanId: 'root', ParentSpanId: '' },
+          { ...mockTraceData.data[0], SpanId: 'child', ParentSpanId: 'root' },
+        ],
+      },
+    });
+    renderComponent(null, mockTraceId, { highlightedRowWhere: 'child' });
+    await waitForLoading();
+    expect(MockTimelineMinimap.latestProps.highlightedRow?.index).toBe(1);
+    await userEvent.click(screen.getByLabelText('Collapse all'));
+    expect(MockTimelineMinimap.latestProps.highlightedRow).toBeUndefined();
+    expect(MockTimelineMinimap.latestProps.rows).toHaveLength(1);
+    await userEvent.click(screen.getByLabelText('Expand all'));
+    expect(MockTimelineMinimap.latestProps.highlightedRow?.index).toBe(1);
   });
 
   it.each([
@@ -1484,6 +1580,46 @@ describe('useEventsAroundFocus', () => {
       expect(selectsSeverityNumber(query)).toBe(selectSeverityNumber);
       expect(getRowWhere).toHaveBeenCalledWith({ Body: 'log line' });
       expect(result.rows[0]).toMatchObject({ SeverityNumber: 17 });
+    },
+  );
+
+  it('buffers both waterfall query windows until their complete pages arrive', () => {
+    testEventsAroundFocus({});
+    expect(
+      mockUseOffsetPaginatedQuery.mock.calls.map(
+        ([, options]) => options.enableStreaming,
+      ),
+    ).toEqual([false, false]);
+  });
+
+  it.each([
+    { enableStreaming: undefined, expected: true },
+    { enableStreaming: false, expected: false },
+  ])(
+    'preserves streaming for shared event lookups by default ($enableStreaming)',
+    ({ enableStreaming, expected }) => {
+      mockUseOffsetPaginatedQuery
+        .mockReset()
+        .mockReturnValue({ data: undefined, isFetching: false });
+      renderHook(() =>
+        useEventsData({
+          config: {
+            from: mockTableSource.from,
+            connection: mockTableSource.connection,
+            timestampValueExpression: mockTableSource.timestampValueExpression,
+            select: [{ valueExpression: 'SessionId' }],
+            where: "TraceId = 'test-trace-id'",
+          },
+          dateRangeStartInclusive: true,
+          dateRange: mockDateRange,
+          enabled: true,
+          enableStreaming,
+        }),
+      );
+      expect(mockUseOffsetPaginatedQuery).toHaveBeenCalledWith(
+        expect.anything(),
+        { enabled: true, enableStreaming: expected },
+      );
     },
   );
 
