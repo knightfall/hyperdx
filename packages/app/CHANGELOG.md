@@ -1,5 +1,26 @@
 # @hyperdx/app
 
+## 2.45.0
+
+### Minor Changes
+
+- b3cbd026: feat: split the service map by up to 3 extra group-by SQL expressions (for
+  example `ResourceAttributes['k8s.pod.name']`), so a node is a service plus
+  those values and a slow or failing pod is no longer averaged into its service.
+
+### Patch Changes
+
+- ac913ceb: feat: Choose how a PromQL source on ClickHouse is evaluated (the Prometheus HTTP API or the `prometheusQuery` table functions) instead of probing the server on every query. Without a choice the server is still probed, but the answer is now kept for 5 minutes. A source set to the HTTP API against a server that does not serve it fails with a clear error. Onboarding pins a PromQL source it detects to the HTTP API when the server serves it.
+- Updated dependencies [c17fc16a]
+- Updated dependencies [1fba1c38]
+- Updated dependencies [7b03880e]
+- Updated dependencies [2d17de5d]
+- Updated dependencies [ac913ceb]
+- Updated dependencies [7cfd333e]
+- Updated dependencies [db4e7ba6]
+  - @hyperdx/api@2.45.0
+  - @hyperdx/common-utils@0.35.0
+
 ## 2.44.0
 
 ### Minor Changes
