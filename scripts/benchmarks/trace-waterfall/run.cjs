@@ -245,6 +245,15 @@ async function benchmark(browser, base, scenario, repetition) {
   });
   await page.goto(`${base}/?` + new URLSearchParams(scenario));
   await page.waitForFunction(() => window.__loaded);
+  const memory = process.argv.includes('--memory')
+    ? await require('./memory.cjs').startMemoryRecording(
+        context,
+        page,
+        root,
+        scenario,
+        repetition,
+      )
+    : undefined;
   let profiler;
   if (process.argv.includes('--profile')) {
     profiler = await context.newCDPSession(page);
@@ -366,6 +375,7 @@ async function benchmark(browser, base, scenario, repetition) {
     };
     await page.screenshot({ path: path.join(root, 'optimized-selection.png') });
   }
+  if (memory) result.memory = await memory.finish();
   await context.close();
   return { scenario, repetition, ...result, errors };
 }
@@ -399,29 +409,34 @@ async function benchmark(browser, base, scenario, repetition) {
     if (!process.argv.includes('--benchmark-only'))
       await alignment(browser, base);
     if (!process.argv.includes('--alignment-only')) {
-      const scenarios = process.argv.includes('--shuffle')
-        ? [{ spans: 200000, logs: 0, attributeBytes: 512, shuffle: '1' }]
-        : process.argv.includes('--interactions')
-          ? [{ spans: 400000, logs: 400000, attributeBytes: 512 }]
-          : process.argv.includes('--profile')
-            ? [
-                {
-                  spans: process.argv.includes('--worst') ? 400000 : 200000,
-                  logs: process.argv.includes('--worst') ? 400000 : 0,
-                  attributeBytes: 512,
-                },
-              ]
-            : process.argv.includes('--smoke')
+      const scenarios = process.argv.includes('--memory')
+        ? [
+            { spans: 200000, logs: 0, attributeBytes: 512 },
+            { spans: 400000, logs: 400000, attributeBytes: 512 },
+          ]
+        : process.argv.includes('--shuffle')
+          ? [{ spans: 200000, logs: 0, attributeBytes: 512, shuffle: '1' }]
+          : process.argv.includes('--interactions')
+            ? [{ spans: 400000, logs: 400000, attributeBytes: 512 }]
+            : process.argv.includes('--profile')
               ? [
-                  { spans: 200000, logs: 0, attributeBytes: 512 },
-                  { spans: 400000, logs: 400000, attributeBytes: 512 },
+                  {
+                    spans: process.argv.includes('--worst') ? 400000 : 200000,
+                    logs: process.argv.includes('--worst') ? 400000 : 0,
+                    attributeBytes: 512,
+                  },
                 ]
-              : [
-                  { spans: 50000, logs: 0, attributeBytes: 512 },
-                  { spans: 200000, logs: 0, attributeBytes: 512 },
-                  { spans: 400000, logs: 0, attributeBytes: 512 },
-                  { spans: 400000, logs: 400000, attributeBytes: 512 },
-                ];
+              : process.argv.includes('--smoke')
+                ? [
+                    { spans: 200000, logs: 0, attributeBytes: 512 },
+                    { spans: 400000, logs: 400000, attributeBytes: 512 },
+                  ]
+                : [
+                    { spans: 50000, logs: 0, attributeBytes: 512 },
+                    { spans: 200000, logs: 0, attributeBytes: 512 },
+                    { spans: 400000, logs: 0, attributeBytes: 512 },
+                    { spans: 400000, logs: 400000, attributeBytes: 512 },
+                  ];
       for (const scenario of scenarios)
         for (
           let repetition = 1;
@@ -436,19 +451,21 @@ async function benchmark(browser, base, scenario, repetition) {
         ) {
           const result = await benchmark(browser, base, scenario, repetition);
           output.results.push(result);
-          const outputName = process.argv.includes('--optimized')
-            ? process.argv.includes('--interactions')
-              ? 'interactions-optimized.json'
-              : process.argv.includes('--shuffle')
-                ? 'shuffled-optimized.json'
-                : process.argv.includes('--profile')
-                  ? 'profile-optimized.json'
-                  : process.argv.includes('--smoke')
-                    ? 'smoke-optimized.json'
-                    : 'performance-optimized.json'
-            : process.argv.includes('--profile')
-              ? 'profile-results.json'
-              : 'performance-results.json';
+          const outputName = process.argv.includes('--memory')
+            ? 'memory-results.json'
+            : process.argv.includes('--optimized')
+              ? process.argv.includes('--interactions')
+                ? 'interactions-optimized.json'
+                : process.argv.includes('--shuffle')
+                  ? 'shuffled-optimized.json'
+                  : process.argv.includes('--profile')
+                    ? 'profile-optimized.json'
+                    : process.argv.includes('--smoke')
+                      ? 'smoke-optimized.json'
+                      : 'performance-optimized.json'
+              : process.argv.includes('--profile')
+                ? 'profile-results.json'
+                : 'performance-results.json';
           fs.writeFileSync(
             path.join(root, outputName),
             JSON.stringify(output, null, 2),
@@ -460,6 +477,12 @@ async function benchmark(browser, base, scenario, repetition) {
               initialLoadMs: result.initialLoadMs,
               longestTaskMs: result.longestTaskMs,
               usedHeapMiB: result.usedHeapMiB,
+              memory: result.memory && {
+                peakMiB: result.memory.peakMiB,
+                loaded: result.memory.loaded,
+                unmounted: result.memory.unmounted,
+                cleared: result.memory.cleared,
+              },
               renderedRows: result.renderedRows,
               errors: result.errors,
             }),

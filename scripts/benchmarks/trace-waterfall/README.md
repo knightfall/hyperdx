@@ -57,3 +57,13 @@ browser-context detection scan remains. The transport calls `JSON.parse` for
 
 Heap samples are post-paint used JS heap without forced collection: they include
 collectible garbage and are not retained-heap or peak measurements.
+
+Use `--memory --benchmark-only` to measure retained JS heap after garbage
+collection, a 20ms sampled load peak, and memory after chart unmount and
+query-cache cleanup. It runs three fresh contexts each at 200,000 spans and at
+400,000 spans plus 400,000 logs. The first repetition also records live
+allocation samples and source-mapped summaries. Set `WATERFALL_ARTIFACTS` to
+separate baseline and optimized output directories, then run
+`node scripts/benchmarks/trace-waterfall/memory-report.cjs` to compare
+`memory-before/` and `memory-after/`. These measurements differ from the
+uncollected heap samples above.

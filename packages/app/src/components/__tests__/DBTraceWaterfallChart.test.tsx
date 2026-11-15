@@ -1583,6 +1583,31 @@ describe('useEventsAroundFocus', () => {
     },
   );
 
+  it('limits cached waterfall attributes and releases inactive windows', () => {
+    testEventsAroundFocus({});
+    for (const [, options] of mockUseOffsetPaginatedQuery.mock.calls) {
+      expect(options.gcTime).toBe(0);
+      expect(options.resultTransform.cacheKey).toBe('waterfall-attributes-v1');
+    }
+  });
+
+  it.each([
+    { sqlExpression: 'SpanAttributes' },
+    { sqlExpression: 'CustomAttributes', alias: 'SpanAttributes' },
+  ])(
+    'preserves whole attribute maps when explicitly highlighted (%p)',
+    attribute => {
+      testEventsAroundFocus({
+        tableSource: {
+          ...mockTableSource,
+          highlightedTraceAttributeExpressions: [attribute],
+        },
+      });
+      for (const [, options] of mockUseOffsetPaginatedQuery.mock.calls)
+        expect(options.resultTransform).toBeUndefined();
+    },
+  );
+
   it('buffers both waterfall query windows until their complete pages arrive', () => {
     testEventsAroundFocus({});
     expect(

@@ -166,6 +166,138 @@ describe('useOffsetPaginatedQuery', () => {
   });
 
   describe('Buffered waterfall results', () => {
+    it.each([true, false])(
+      'isolates transformed results and caches only transformed rows (streaming=%p)',
+      async enableStreaming => {
+        mockClickhouseClient.query.mockImplementation(async () => ({
+          stream: () => ({
+            getReader: () => ({
+              read: jest
+                .fn()
+                .mockResolvedValueOnce({
+                  done: false,
+                  value: [
+                    { json: () => ['SpanId', 'Payload'] },
+                    { json: () => ['String', 'String'] },
+                    { json: () => ['span', 'large payload'] },
+                  ],
+                })
+                .mockResolvedValueOnce({ done: true }),
+            }),
+          }),
+        }));
+        const config = createMockChartConfig({ orderBy: 'ServiceName' });
+        const resultTransform = {
+          cacheKey: 'test-compact-v1',
+          transform: (row: Record<string, unknown>) => ({ SpanId: row.SpanId }),
+        };
+        const { result } = renderHook(
+          () => ({
+            raw: useOffsetPaginatedQuery(config, { enableStreaming }),
+            compact: useOffsetPaginatedQuery(config, {
+              enableStreaming,
+              resultTransform,
+            }),
+          }),
+          { wrapper },
+        );
+        await waitFor(() =>
+          expect(
+            result.current.raw.isFetching || result.current.compact.isFetching,
+          ).toBe(false),
+        );
+        expect(result.current.raw.data?.data).toEqual([
+          { SpanId: 'span', Payload: 'large payload' },
+        ]);
+        expect(result.current.compact.data?.data).toEqual([{ SpanId: 'span' }]);
+        expect(mockClickhouseClient.query).toHaveBeenCalledTimes(2);
+        const compact = queryClient
+          .getQueryCache()
+          .getAll()
+          .find(q => q.queryKey[4] === resultTransform.cacheKey);
+        expect(compact?.state.data).toMatchObject({
+          pages: [{ data: [{ SpanId: 'span' }] }],
+        });
+      },
+    );
+
+    it('does not show a differently transformed previous result in live mode', async () => {
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId', 'Payload'] },
+            { json: () => ['String', 'String'] },
+            { json: () => ['span', 'large payload'] },
+          ],
+        })
+        .mockResolvedValueOnce({ done: true });
+      const config = createMockChartConfig({ orderBy: 'ServiceName' });
+      const resultTransform = {
+        cacheKey: 'live-compact-v1',
+        transform: (row: Record<string, unknown>) => ({ SpanId: row.SpanId }),
+      };
+      const { result, rerender } = renderHook(
+        ({ compact }) =>
+          useOffsetPaginatedQuery(config, {
+            isLive: true,
+            enableStreaming: false,
+            resultTransform: compact ? resultTransform : undefined,
+          }),
+        { wrapper, initialProps: { compact: false } },
+      );
+      await waitFor(() => expect(result.current.isFetching).toBe(false));
+      expect(result.current.data?.data).toEqual([
+        { SpanId: 'span', Payload: 'large payload' },
+      ]);
+      mockReader.read.mockImplementationOnce(() => new Promise(() => {}));
+      rerender({ compact: true });
+      await waitFor(() =>
+        expect(mockClickhouseClient.query).toHaveBeenCalledTimes(2),
+      );
+      expect(result.current.data).toBeNull();
+      await act(() => queryClient.cancelQueries());
+    });
+
+    it('removes an opted-out inactive query while keeping other active observers', async () => {
+      mockReader.read
+        .mockResolvedValueOnce({
+          done: false,
+          value: [
+            { json: () => ['SpanId'] },
+            { json: () => ['String'] },
+            { json: () => ['span'] },
+          ],
+        })
+        .mockResolvedValueOnce({ done: true });
+      const config = createMockChartConfig({ orderBy: 'ServiceName' });
+      const first = renderHook(
+        () =>
+          useOffsetPaginatedQuery(config, {
+            enableStreaming: false,
+            gcTime: 0,
+          }),
+        { wrapper },
+      );
+      await waitFor(() => expect(first.result.current.isFetching).toBe(false));
+      const second = renderHook(
+        () =>
+          useOffsetPaginatedQuery(config, {
+            enableStreaming: false,
+            gcTime: 0,
+          }),
+        { wrapper },
+      );
+      first.unmount();
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(second.result.current.data?.data).toEqual([{ SpanId: 'span' }]);
+      expect(mockClickhouseClient.query).toHaveBeenCalledTimes(1);
+      second.unmount();
+      await waitFor(() =>
+        expect(queryClient.getQueryCache().getAll()).toHaveLength(0),
+      );
+    });
+
     it.each([256, 200_000])(
       'returns 200,000 rows in %s-row chunks without publishing partial pages',
       async chunkSize => {

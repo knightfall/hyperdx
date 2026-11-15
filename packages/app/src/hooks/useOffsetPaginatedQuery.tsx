@@ -55,16 +55,32 @@ type TQueryKey = readonly [
   ChartConfigWithOptTimestamp,
   number | undefined,
   false?,
+  string?,
 ];
+
+export type QueryResultTransform = {
+  /** Versioned identity: different cached representations must use different keys. */
+  cacheKey: string;
+  transform: (row: Record<string, any>) => Record<string, any>;
+};
 
 function queryKeyFn(
   prefix: string,
   config: ChartConfigWithOptTimestamp,
   queryTimeout?: number,
   enableStreaming = true,
+  resultTransformKey?: string,
 ): TQueryKey {
   // Isolate buffered queries so another observer cannot change their streaming
   // policy. Preserve existing cache keys for callers that stream partial rows.
+  if (resultTransformKey !== undefined)
+    return [
+      prefix,
+      config,
+      queryTimeout,
+      enableStreaming ? undefined : false,
+      resultTransformKey,
+    ];
   return enableStreaming
     ? [prefix, config, queryTimeout]
     : [prefix, config, queryTimeout, false];
@@ -77,6 +93,7 @@ function differsOnlyInDateRange(a: TQueryKey, b: TQueryKey) {
     a[0] === b[0] &&
     a[2] === b[2] &&
     a[3] === b[3] &&
+    a[4] === b[4] &&
     isEqual(omit(a[1], ['dateRange']), omit(b[1], ['dateRange']))
   );
 }
@@ -111,6 +128,7 @@ type QueryMeta = {
    * split the cache per surface.
    */
   attribution: QueryAttribution;
+  resultTransform?: QueryResultTransform;
 };
 
 // Get time window from page param
@@ -206,6 +224,7 @@ const queryFn: QueryFunction<TQueryFnData, TQueryKey, TPageParam> = async ({
     optimizedConfig,
     source,
     attribution,
+    resultTransform,
   } = meta as QueryMeta;
 
   // Only stream incrementally if this is a fresh query with no previous
@@ -243,7 +262,7 @@ const queryFn: QueryFunction<TQueryFnData, TQueryKey, TPageParam> = async ({
       attribution,
     );
     return {
-      data,
+      data: resultTransform ? data.map(resultTransform.transform) : data,
       meta: meta ?? [],
       chSql: { sql: '', params: {} },
       window: timeWindow,
@@ -340,88 +359,91 @@ const queryFn: QueryFunction<TQueryFnData, TQueryKey, TPageParam> = async ({
   const queryResultData: Record<string, unknown>[] = [];
 
   async function read(): Promise<void> {
-    const { done, value } = await reader.read();
+    while (true) {
+      const { done, value } = await reader.read();
 
-    if (done || value == null) {
-      return;
-    }
+      if (done || value == null) {
+        return;
+      }
 
-    if (queryResultMeta.length === 0) {
-      for (const row of value) headerRows.push(row);
-    }
-
-    if (queryResultMeta.length > 0 || headerRows.length >= 2) {
-      let dataRows = value;
       if (queryResultMeta.length === 0) {
-        const names = headerRows[0].json<string[]>();
-        const values = headerRows[1].json<string[]>();
-
-        if (names.length !== values.length) {
-          throw new Error(
-            'Invalid JSONCompactEachRowWithNamesAndTypes header rows',
-          );
-        }
-
-        for (let i = 0; i < names.length; i++) {
-          queryResultMeta.push({
-            name: names[i],
-            type: values[i],
-          });
-        }
-
-        dataRows = headerRows.slice(2);
-        headerRows.length = 0;
+        for (const row of value) headerRows.push(row);
       }
 
-      const rowObjs: Record<string, unknown>[] = [];
-      for (let i = 0; i < dataRows.length; i++) {
-        const rowArr = dataRows[i].json();
-        const rowObj: Record<string, unknown> = {};
-        for (let j = 0; j < rowArr.length; j++) {
-          rowObj[queryResultMeta[j].name] = rowArr[j];
+      if (queryResultMeta.length > 0 || headerRows.length >= 2) {
+        let dataRows = value;
+        if (queryResultMeta.length === 0) {
+          const names = headerRows[0].json<string[]>();
+          const values = headerRows[1].json<string[]>();
+
+          if (names.length !== values.length) {
+            throw new Error(
+              'Invalid JSONCompactEachRowWithNamesAndTypes header rows',
+            );
+          }
+
+          for (let i = 0; i < names.length; i++) {
+            queryResultMeta.push({
+              name: names[i],
+              type: values[i],
+            });
+          }
+
+          dataRows = headerRows.slice(2);
+          headerRows.length = 0;
         }
 
-        if (isStreamingIncrementally) rowObjs.push(rowObj);
-        queryResultData.push(rowObj);
-      }
+        const rowObjs: Record<string, unknown>[] = [];
+        for (let i = 0; i < dataRows.length; i++) {
+          const rowArr = dataRows[i].json();
+          const rowObj: Record<string, unknown> = {};
+          for (let j = 0; j < rowArr.length; j++) {
+            rowObj[queryResultMeta[j].name] = rowArr[j];
+          }
 
-      if (isStreamingIncrementally) {
-        queryClient.setQueryData<TData>(queryKey, oldData => {
-          if (oldData == null) {
+          const decodedRow = resultTransform
+            ? resultTransform.transform(rowObj)
+            : rowObj;
+          if (isStreamingIncrementally) rowObjs.push(decodedRow);
+          queryResultData.push(decodedRow);
+        }
+
+        if (isStreamingIncrementally) {
+          queryClient.setQueryData<TData>(queryKey, oldData => {
+            if (oldData == null) {
+              return {
+                pages: [
+                  {
+                    data: rowObjs,
+                    meta: queryResultMeta,
+                    chSql: query,
+                    window: timeWindow,
+                  },
+                ],
+                pageParams: [pageParam],
+              };
+            }
+
+            const oldPages = oldData.pages.slice(0, -1);
+            const page = oldData.pages[oldData.pages.length - 1];
+
             return {
               pages: [
+                ...oldPages,
                 {
-                  data: rowObjs,
+                  ...page,
+                  data: [...(page.data ?? []), ...rowObjs],
                   meta: queryResultMeta,
                   chSql: query,
                   window: timeWindow,
                 },
               ],
-              pageParams: [pageParam],
+              pageParams: oldData.pageParams,
             };
-          }
-
-          const oldPages = oldData.pages.slice(0, -1);
-          const page = oldData.pages[oldData.pages.length - 1];
-
-          return {
-            pages: [
-              ...oldPages,
-              {
-                ...page,
-                data: [...(page.data ?? []), ...rowObjs],
-                meta: queryResultMeta,
-                chSql: query,
-                window: timeWindow,
-              },
-            ],
-            pageParams: oldData.pageParams,
-          };
-        });
+          });
+        }
       }
     }
-
-    return await read();
   }
 
   function deleteProgressCache() {
@@ -494,6 +516,8 @@ export default function useOffsetPaginatedQuery(
     queryKeyPrefix = '',
     enableSmallFirstWindow,
     enableStreaming = true,
+    resultTransform,
+    gcTime,
   }: {
     isLive?: boolean;
     /** Keep showing the previous result while the same query loads a new date range */
@@ -503,6 +527,10 @@ export default function useOffsetPaginatedQuery(
     enableSmallFirstWindow?: boolean;
     /** Publish partial pages while loading. Disable to return complete pages only. */
     enableStreaming?: boolean;
+    /** Transform each decoded row before publishing or caching it. */
+    resultTransform?: QueryResultTransform;
+    /** Milliseconds to retain this query after its last observer unmounts. */
+    gcTime?: number;
   } = {},
 ) {
   const { data: meData, isLoading: isLoadingMe } = api.useMe();
@@ -511,6 +539,7 @@ export default function useOffsetPaginatedQuery(
     config,
     meData?.team?.queryTimeout,
     enableStreaming,
+    resultTransform?.cacheKey,
   );
   const queryClient = useQueryClient();
   const metadata = useMetadataWithSettings();
@@ -520,7 +549,8 @@ export default function useOffsetPaginatedQuery(
   });
   // TODO: Check that the time ranges overlap
   const hasPreviousQueries = matchedQueries.some(
-    ([queryKey, data]) => data != null && queryKey[3] === key[3],
+    ([queryKey, data]) =>
+      data != null && queryKey[3] === key[3] && queryKey[4] === key[4],
   );
 
   const windowDurationsSeconds = DEFAULT_TIME_WINDOWS_SECONDS.slice();
@@ -560,6 +590,7 @@ export default function useOffsetPaginatedQuery(
       // Only preserve previous query in live mode, or when the caller asks
       // and only the date range changed. Rows from a different config would
       // be rendered with the new config's columns and formats.
+      if (prevQuery && prevQuery.queryKey[4] !== key[4]) return undefined;
       if (isLive) return prev;
       return keepPreviousData &&
         prevQuery != null &&
@@ -587,9 +618,10 @@ export default function useOffsetPaginatedQuery(
       optimizedConfig: mvOptimizationData?.optimizedConfig,
       source,
       attribution,
+      resultTransform,
     } satisfies QueryMeta,
     queryFn,
-    gcTime: isLive ? ms('30s') : ms('5m'), // more aggressive gc for live data, since it can end up holding lots of data
+    gcTime: gcTime ?? (isLive ? ms('30s') : ms('5m')), // more aggressive gc for live data, since it can end up holding lots of data
     retry: 1,
     refetchOnWindowFocus: false,
     maxPages: isLive ? 5 : undefined, // Limit number of pages kept in cache for live data

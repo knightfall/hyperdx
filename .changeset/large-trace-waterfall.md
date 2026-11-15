@@ -9,3 +9,5 @@ Buffer waterfall query results until each page is complete, preserve the selecte
 Keep the minimap selection aligned with its canvas bar inside the bordered strip.
 
 Prepare large waterfalls in cancellable chunks, reuse per-window row IDs and parsed timestamps, resolve bulk bar colors once per status/service, and reuse tree nodes when flattening.
+
+Reduce waterfall memory by filtering unused span attributes before caching and releasing inactive query windows. Preserve HTTP/RPC labels, browser context, complete event details, and explicitly highlighted attributes.

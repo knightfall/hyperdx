@@ -8,6 +8,10 @@ import { TimelineMinimap } from '@/components/TimelineChart/TimelineMinimap';
 import '@mantine/core/styles.css';
 
 window.Buffer = Buffer;
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: false } },
+});
+window.__queryClient = queryClient;
 
 const parameters = new URLSearchParams(location.search);
 const START = Date.UTC(2024, 0, 1);
@@ -78,6 +82,7 @@ function Benchmark() {
       window.__longTasks = [];
       setReady(true);
     };
+    window.__stopBenchmark = () => setReady(false);
     window.__loaded = true;
   }, []);
   return (
@@ -142,11 +147,7 @@ createRoot(document.getElementById('root')).render(
   <MantineProvider
     forceColorScheme={parameters.get('theme') === 'light' ? 'light' : 'dark'}
   >
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={queryClient}>
       {parameters.get('mode') === 'alignment' ? <Alignment /> : <Benchmark />}
     </QueryClientProvider>
   </MantineProvider>,

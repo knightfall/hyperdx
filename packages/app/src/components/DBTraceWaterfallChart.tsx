@@ -67,6 +67,7 @@ import {
 } from '@/utils/highlightedAttributes';
 
 import { DBHighlightedAttributesList } from './DBHighlightedAttributesList';
+import { waterfallResultTransform } from './traceWaterfallAttributes';
 import {
   buildWaterfallTree,
   createFlattenedWaterfallRows,
@@ -327,12 +328,17 @@ export function useEventsData({
   dateRange,
   enabled,
   enableStreaming = true,
+  queryOptions,
 }: {
   config: ChartConfig;
   dateRangeStartInclusive: boolean;
   dateRange: [Date, Date];
   enabled: boolean;
   enableStreaming?: boolean;
+  queryOptions?: Pick<
+    NonNullable<Parameters<typeof useOffsetPaginatedQuery>[1]>,
+    'resultTransform' | 'gcTime'
+  >;
 }) {
   const query: ChartConfigWithDateRange = useMemo(() => {
     return {
@@ -341,7 +347,11 @@ export function useEventsData({
       dateRangeStartInclusive,
     };
   }, [config, dateRange, dateRangeStartInclusive]);
-  return useOffsetPaginatedQuery(query, { enabled, enableStreaming });
+  return useOffsetPaginatedQuery(query, {
+    ...queryOptions,
+    enabled,
+    enableStreaming,
+  });
 }
 
 export function useEventsAroundFocus({
@@ -382,6 +392,19 @@ export function useEventsAroundFocus({
     ],
   );
 
+  const queryOptions = useMemo(
+    () => ({
+      // Explicitly highlighted whole-attribute maps must stay available to the label.
+      resultTransform: getSelectExpressionsForHighlightedAttributes(
+        tableSource.highlightedTraceAttributeExpressions,
+      ).some(column => column.alias === 'SpanAttributes')
+        ? undefined
+        : waterfallResultTransform,
+      gcTime: 0,
+    }),
+    [tableSource.highlightedTraceAttributeExpressions],
+  );
+
   const {
     data: beforeSpanData,
     isFetching: isBeforeSpanFetching,
@@ -392,6 +415,7 @@ export function useEventsAroundFocus({
     dateRange: [dateRange[0], focusDate],
     enabled,
     enableStreaming: false,
+    queryOptions,
   });
 
   const {
@@ -404,6 +428,7 @@ export function useEventsAroundFocus({
     dateRange: [focusDate, dateRange[1]],
     enabled,
     enableStreaming: false,
+    queryOptions,
   });
 
   const isFetching = isBeforeSpanFetching || isAfterSpanFetching;
