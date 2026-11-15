@@ -243,8 +243,14 @@ describe('getMaxEventValue', () => {
     expect(getMaxEventValue(rows)).toBeCloseTo(550);
   });
 
-  it('returns 0 for empty input', () => {
-    expect(getMaxEventValue([])).toBe(0);
-    expect(getMaxEventValue([{ events: [] }])).toBe(0);
+  it('uses a positive range for empty input', () => {
+    expect(getMaxEventValue([])).toBe(1);
+    expect(getMaxEventValue([{ events: [] }])).toBe(1);
   });
+});
+
+it('keeps zero-duration spans at a finite left edge with a positive shared range', () => {
+  const max = getMaxEventValue([{ events: [{ end: 0 }] }]);
+  expect(max).toBe(1);
+  expect(0 / max).toBe(0);
 });

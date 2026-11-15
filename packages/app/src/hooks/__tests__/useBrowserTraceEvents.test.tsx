@@ -249,6 +249,21 @@ describe('useBrowserTraceEvents', () => {
     expect(result.current.triggerRow).toBeUndefined();
   });
 
+  it('keeps folded log identity when unrelated spans or unfolded logs are selected', () => {
+    const spans = Array.from({ length: 1001 }, (_, i) => ({
+      ...browserSpan,
+      SpanId: 'span-' + (i + 1),
+    }));
+    const { result, rerender, initialProps } = setup({ traceRows: spans });
+    const before = result.current.logRows;
+    rerender({ ...initialProps, highlightedRowWhere: 'unrelated-span' });
+    expect(result.current.logRows).toBe(before);
+    rerender({ ...initialProps, highlightedRowWhere: consoleLogRow.id });
+    expect(result.current.logRows).toBe(before);
+    rerender({ ...initialProps, highlightedRowWhere: 'another-span' });
+    expect(result.current.logRows).toBe(before);
+  });
+
   it('keeps the selected timing row until another row is selected', () => {
     const { result, rerender, initialProps } = setup({
       highlightedRowWhere: 'timing-row',
@@ -259,6 +274,22 @@ describe('useBrowserTraceEvents', () => {
 
     rerender({ ...initialProps, highlightedRowWhere: 'console-row' });
     expect(result.current.logRows).toEqual([consoleLogRow]);
+  });
+
+  it('keeps identity when selection targets a timing row already pinned by its hint', () => {
+    const hint = { timestamp: TIMING_TIMESTAMP, spanId: 'span-1', body: '' };
+    const { result, rerender, initialProps } = setup({
+      initialRowHighlightHint: hint,
+    });
+    const before = result.current.logRows;
+    rerender({
+      ...initialProps,
+      highlightedRowWhere: 'timing-row',
+      initialRowHighlightHint: { ...hint },
+    });
+    expect(result.current.logRows).toBe(before);
+    rerender({ ...initialProps, highlightedRowWhere: 'unrelated-span' });
+    expect(result.current.logRows).toBe(before);
   });
 
   it('keeps the timing row the panel was opened from', () => {

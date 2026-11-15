@@ -10,7 +10,8 @@ export function getMaxEventValue(
       max = Math.max(max, event.end);
     }
   }
-  return max * 1.1;
+  // In-progress spans may all have zero duration; positions still need a divisor.
+  return max > 0 ? max * 1.1 : 1;
 }
 
 // Number of decimal places needed to render values spaced `step` apart without

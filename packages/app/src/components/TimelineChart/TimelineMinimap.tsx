@@ -3,28 +3,26 @@ import { ActionIcon, Tooltip } from '@mantine/core';
 import { IconZoomReset } from '@tabler/icons-react';
 
 import type { TimelineViewportController } from './TimelineChart';
-import type { TTimelineEvent } from './TimelineChartRowEvents';
+import {
+  MINIMAP_HEIGHT,
+  type MinimapRow,
+  TimelineMinimapBars,
+  TimelineMinimapHighlight,
+} from './TimelineMinimapBars';
 import { getMaxEventValue, renderMs } from './utils';
 
 import styles from './TimelineMinimap.module.scss';
-
-type MinimapRow = {
-  events: TTimelineEvent[];
-};
 
 type DragMode = 'pan' | 'resize-left' | 'resize-right' | 'brush' | null;
 
 type TimelineMinimapProps = {
   rows: MinimapRow[];
   controller: TimelineViewportController | null;
+  highlightedRow?: React.ComponentProps<typeof TimelineMinimapHighlight>['row'];
 };
 
-const TICK_HEIGHT = 18;
-const BAR_AREA_HEIGHT = 34;
-const MINIMAP_HEIGHT = TICK_HEIGHT + BAR_AREA_HEIGHT;
 // Pixel width of the grab zone on each side of the viewport for resize handles.
 const HANDLE_HIT_AREA = 8;
-const BAR_HEIGHT = 2;
 // Below this brushed width (timeline fraction) a brush is treated as a click,
 // not a zoom — avoids accidental extreme zooms on a stray drag.
 const MIN_BRUSH_FRAC = 0.01;
@@ -50,9 +48,16 @@ const HandleGrip = ({ side }: { side: 'left' | 'right' }) => (
   </div>
 );
 
+// Persistent pointer callbacks share their render's closure context. Keep the
+// large rows array in a separate hook scope so those callbacks cannot retain it.
+function useMinimapMaxValue(rows: MinimapRow[]) {
+  return useMemo(() => getMaxEventValue(rows), [rows]);
+}
+
 export const TimelineMinimap = memo(function ({
   rows,
   controller,
+  highlightedRow,
 }: TimelineMinimapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragModeRef = useRef<DragMode>(null);
@@ -92,7 +97,7 @@ export const TimelineMinimap = memo(function ({
     return controller.subscribe(update);
   }, [controller]);
 
-  const maxVal = useMemo(() => getMaxEventValue(rows), [rows]);
+  const maxVal = useMinimapMaxValue(rows);
 
   const viewportStartFrac = viewport.offsetFrac;
   const viewportWidthFrac = viewport.widthFrac;
@@ -275,6 +280,12 @@ export const TimelineMinimap = memo(function ({
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
     >
+      <TimelineMinimapBars rows={rows} maxVal={maxVal} />
+      <TimelineMinimapHighlight
+        row={highlightedRow}
+        rowCount={rows.length}
+        maxVal={maxVal}
+      />
       {ticks.map(({ frac, label }) => (
         <div
           key={frac}
@@ -284,36 +295,6 @@ export const TimelineMinimap = memo(function ({
           <span className={styles.tickLabel}>{label}</span>
         </div>
       ))}
-
-      {maxVal > 0 &&
-        rows.map((row, rowIdx) =>
-          row.events.map(event => {
-            const left = (event.start / maxVal) * 100;
-            const width = Math.max(
-              ((event.end - event.start) / maxVal) * 100,
-              0.15,
-            );
-            return (
-              <div
-                key={event.id}
-                className={styles.bar}
-                style={{
-                  left: `${left}%`,
-                  width: `${width}%`,
-                  top:
-                    TICK_HEIGHT +
-                    2 +
-                    Math.round(
-                      (rowIdx / Math.max(rows.length, 1)) *
-                        (BAR_AREA_HEIGHT - BAR_HEIGHT - 4),
-                    ),
-                  height: BAR_HEIGHT,
-                  backgroundColor: event.backgroundColor,
-                }}
-              />
-            );
-          }),
-        )}
 
       {isZoomed && (
         <>
@@ -353,7 +334,7 @@ export const TimelineMinimap = memo(function ({
           <ActionIcon
             className={styles.resetButton}
             size="xs"
-            variant="default"
+            variant="secondary"
             aria-label="Reset minimap zoom"
             onClick={handleReset}
             onPointerDown={e => e.stopPropagation()}

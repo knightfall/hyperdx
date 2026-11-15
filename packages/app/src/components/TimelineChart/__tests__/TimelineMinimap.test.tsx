@@ -1,15 +1,31 @@
-import { fireEvent, screen } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 
 import type { TimelineViewportController } from '@/components/TimelineChart';
 import { TimelineMinimap } from '@/components/TimelineChart/TimelineMinimap';
+import { TimelineMinimapBars } from '@/components/TimelineChart/TimelineMinimapBars';
 
 // jsdom has no layout engine, so getBoundingClientRect returns zeros and
 // setPointerCapture is unimplemented. Pin the container to a known 1000px-wide
 // box and stub pointer capture so getXFraction math is deterministic
 // (clientX / 1000 = fraction).
 const CONTAINER_WIDTH = 1000;
+const fillRect = jest.fn();
+const clearRect = jest.fn();
+const setTransform = jest.fn();
+const paintedColors: string[] = [];
 
 beforeAll(() => {
+  jest.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+    () =>
+      ({
+        clearRect,
+        setTransform,
+        fillRect,
+        set fillStyle(value: string) {
+          paintedColors.push(value);
+        },
+      }) as unknown as CanvasRenderingContext2D,
+  );
   // jsdom doesn't implement PointerEvent, so fireEvent.pointerXxx would drop
   // clientX. Back it with MouseEvent (which honors clientX from init).
   if (typeof window.PointerEvent === 'undefined') {
@@ -33,6 +49,12 @@ beforeAll(() => {
     y: 0,
     toJSON: () => ({}),
   } as DOMRect);
+});
+
+beforeEach(() => {
+  fillRect.mockClear();
+  clearRect.mockClear();
+  paintedColors.length = 0;
 });
 
 afterAll(() => {
@@ -88,14 +110,221 @@ describe('TimelineMinimap', () => {
       viewportWidthFrac: 1,
     });
     renderWithMantine(<TimelineMinimap rows={rows} controller={controller} />);
-    const minimap = screen.getByTestId('timeline-minimap');
-    const bars = Array.from(minimap.querySelectorAll('div')).filter(el =>
-      /rgb\(/.test(el.style.backgroundColor),
-    );
-    expect(bars.length).toBe(2);
-    expect(bars.map(b => b.style.backgroundColor)).toEqual(
+    expect(fillRect).toHaveBeenCalledTimes(2);
+    expect(paintedColors).toEqual(
       expect.arrayContaining(['rgb(10, 20, 30)', 'rgb(40, 50, 60)']),
     );
+  });
+
+  it('moves and clears the selection overlay without redrawing the base canvas', () => {
+    const highlightedRow = {
+      index: 0,
+      events: [{ ...rows[0].events[1], backgroundColor: 'rgb(200, 100, 50)' }],
+    };
+    const view = renderWithMantine(
+      <TimelineMinimap
+        rows={rows}
+        controller={null}
+        highlightedRow={highlightedRow}
+      />,
+    );
+    const highlight = screen.getByTestId('timeline-minimap-highlight');
+    expect(highlight).toHaveStyle({
+      backgroundColor: 'rgb(200, 100, 50)',
+      height: `${(2 / 52) * 100}%`,
+      top: `${(20 / 52) * 100}%`,
+    });
+    expect(parseFloat(highlight.style.left)).toBeCloseTo((100 / 330) * 100);
+    expect(parseFloat(highlight.style.width)).toBeCloseTo((200 / 330) * 100);
+    const drawCount = fillRect.mock.calls.length;
+    view.rerender(
+      <TestProviders>
+        <TimelineMinimap
+          rows={rows}
+          controller={null}
+          highlightedRow={{
+            index: 0,
+            events: [
+              { ...rows[0].events[0], backgroundColor: 'rgb(20, 40, 60)' },
+            ],
+          }}
+        />
+      </TestProviders>,
+    );
+    expect(screen.getByTestId('timeline-minimap-highlight')).toHaveStyle({
+      backgroundColor: 'rgb(20, 40, 60)',
+      left: '0%',
+    });
+    expect(fillRect).toHaveBeenCalledTimes(drawCount);
+    view.rerender(
+      <TestProviders>
+        <TimelineMinimap rows={rows} controller={null} />
+      </TestProviders>,
+    );
+    expect(
+      screen.queryByTestId('timeline-minimap-highlight'),
+    ).not.toBeInTheDocument();
+    expect(fillRect).toHaveBeenCalledTimes(drawCount);
+  });
+
+  it.each([0, 500, 1000])(
+    'scales the selection and canvas together inside the border (row %s)',
+    index => {
+      const minimapRows = Array.from({ length: 1001 }, () => ({
+        events: [rows[0].events[0]],
+      }));
+      const view = renderWithMantine(
+        <TimelineMinimap
+          rows={minimapRows}
+          controller={null}
+          highlightedRow={{ index, events: minimapRows[index].events }}
+        />,
+      );
+      const canvas = view.container.querySelector('canvas')!;
+      const highlight = screen.getByTestId('timeline-minimap-highlight');
+      const [, top, , height] = fillRect.mock.calls[index];
+      const displayedHeight = 50; // The 52px border box has two 1px borders.
+      expect(highlight.style.top).toContain('%');
+      expect(highlight.style.height).toContain('%');
+      expect(
+        (parseFloat(highlight.style.top) / 100) * displayedHeight,
+      ).toBeCloseTo((top / canvas.height) * displayedHeight);
+      expect(
+        (parseFloat(highlight.style.height) / 100) * displayedHeight,
+      ).toBeCloseTo((height / canvas.height) * displayedHeight);
+    },
+  );
+
+  it.each([-1, 1])(
+    'ignores a selected row outside the visible rows (%s)',
+    index => {
+      renderWithMantine(
+        <TimelineMinimap
+          rows={rows}
+          controller={null}
+          highlightedRow={{ index, events: rows[0].events }}
+        />,
+      );
+      expect(
+        screen.queryByTestId('timeline-minimap-highlight'),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it('redraws for width and pixel-density changes, but skips unchanged resize notifications', () => {
+    const resizeObserver = jest
+      .spyOn(window, 'ResizeObserver')
+      .mockImplementation(() => ({
+        observe: jest.fn(),
+        unobserve: jest.fn(),
+        disconnect: jest.fn(),
+      }));
+    const bounds = HTMLElement.prototype.getBoundingClientRect();
+    const measure = jest.spyOn(HTMLElement.prototype, 'getBoundingClientRect');
+    const pixelRatio = jest.replaceProperty(window, 'devicePixelRatio', 2);
+    try {
+      const view = renderWithMantine(
+        <TimelineMinimapBars rows={rows} maxVal={330} />,
+      );
+      const canvas = view.container.querySelector('canvas');
+      const resize = resizeObserver.mock.calls[0][0];
+      const observer = resizeObserver.mock.results[0].value;
+      expect(canvas?.width).toBe(2000);
+      expect(fillRect).toHaveBeenCalledTimes(2);
+      resize([], observer);
+      expect(fillRect).toHaveBeenCalledTimes(2);
+      measure.mockReturnValue({ ...bounds, width: 500 });
+      resize([], observer);
+      expect(canvas?.width).toBe(1000);
+      expect(fillRect).toHaveBeenLastCalledWith(
+        expect.closeTo((100 / 330) * 500, 6),
+        20,
+        expect.closeTo((200 / 330) * 500, 6),
+        2,
+      );
+      pixelRatio.replaceValue(1);
+      resize([], observer);
+      expect(canvas?.width).toBe(500);
+      expect(fillRect).toHaveBeenCalledTimes(6);
+      view.unmount();
+      expect(observer.disconnect).toHaveBeenCalled();
+    } finally {
+      measure.mockReturnValue(bounds);
+      pixelRatio.restore();
+      resizeObserver.mockRestore();
+    }
+  });
+
+  it('draws all 200,000 spans on one canvas and keeps bars stable while zooming', async () => {
+    const largeRows = Array.from({ length: 200_000 }, (_, i) => ({
+      events: [{ ...rows[0].events[0], id: String(i), start: i, end: i + 1 }],
+    }));
+    const controller = makeController({
+      scale: 1,
+      offsetFrac: 0,
+      viewportWidthFrac: 1,
+    });
+    renderWithMantine(
+      <TimelineMinimap rows={largeRows} controller={controller} />,
+    );
+    const minimap = screen.getByTestId('timeline-minimap');
+    expect(minimap.querySelectorAll('canvas')).toHaveLength(1);
+    expect(minimap.querySelectorAll('div').length).toBeLessThan(20);
+    await waitFor(() =>
+      expect(minimap.querySelector('canvas')).toHaveAttribute(
+        'data-rendering',
+        'false',
+      ),
+    );
+    expect(fillRect).toHaveBeenCalledTimes(200_000);
+    expect(fillRect).toHaveBeenLastCalledWith(
+      expect.closeTo((199_999 / 220_000) * 1000, 6),
+      48,
+      1.5,
+      2,
+    );
+    fireEvent.pointerDown(minimap, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(minimap, { clientX: 600, pointerId: 1 });
+    fireEvent.pointerUp(minimap, { pointerId: 1 });
+    expect(controller.zoomToRange).toHaveBeenCalledWith(0.1, 0.6);
+    expect(fillRect).toHaveBeenCalledTimes(200_000);
+  });
+
+  it('yields a large canvas draw and cancels it when rows change', async () => {
+    jest.useFakeTimers();
+    let clock = 0;
+    const time = jest
+      .spyOn(performance, 'now')
+      .mockImplementation(() => (clock += 10));
+    try {
+      const manyRows = Array.from({ length: 1001 }, () => ({
+        events: [rows[0].events[0]],
+      }));
+      const view = renderWithMantine(
+        <TimelineMinimap rows={manyRows} controller={null} />,
+      );
+      const minimap = screen.getByTestId('timeline-minimap');
+      expect(fillRect).toHaveBeenCalledTimes(1000);
+      expect(minimap.querySelector('canvas')).toHaveAttribute(
+        'data-rendering',
+        'true',
+      );
+      view.rerender(
+        <TestProviders>
+          <TimelineMinimap rows={rows} controller={null} />
+        </TestProviders>,
+      );
+      await act(async () => jest.runAllTimersAsync());
+      expect(fillRect).toHaveBeenCalledTimes(1002);
+      expect(minimap.querySelector('canvas')).toHaveAttribute(
+        'data-rendering',
+        'false',
+      );
+      expect(minimap.querySelector('span[style="display: none;"]')).toBeNull();
+    } finally {
+      time.mockRestore();
+      jest.useRealTimers();
+    }
   });
 
   it('hides viewport chrome (reset button) when fully zoomed out', () => {

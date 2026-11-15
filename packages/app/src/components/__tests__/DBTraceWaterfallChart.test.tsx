@@ -19,8 +19,9 @@ import {
   SpanRow,
   TraceTotalDurationStat,
   useEventsAroundFocus,
+  useEventsData,
 } from '@/components/DBTraceWaterfallChart';
-import { TimelineChart } from '@/components/TimelineChart';
+import { TimelineChart, TimelineMinimap } from '@/components/TimelineChart';
 import { TRACE_WATERFALL_ROW_LIMIT } from '@/components/traceWaterfallLimits';
 import {
   TraceTriggerRow,
@@ -30,6 +31,7 @@ import { useColumns } from '@/hooks/useMetadata';
 import useOffsetPaginatedQuery from '@/hooks/useOffsetPaginatedQuery';
 import useRowWhere from '@/hooks/useRowWhere';
 import { getChartColorError, getChartColorSuccess } from '@/utils';
+import * as highlightedAttributes from '@/utils/highlightedAttributes';
 
 // Mock setup
 jest.mock('@/components/traceWaterfallLimits', () => ({
@@ -58,11 +60,19 @@ jest.mock('@/components/TimelineChart', () => {
   };
 
   const mockComponent = function MockTimelineChart(props: any) {
-    mockComponent.latestProps = props;
+    const [instance] = React.useState(() => Symbol());
+    mockComponent.latestInstance = instance;
+    const renderedProps = {
+      ...props,
+      rows: props.rows.map(
+        (row: any, index: number) => props.renderRow?.(row, index) ?? row,
+      ),
+    };
+    mockComponent.latestProps = renderedProps;
     return (
       <div data-testid="timeline-chart">
         TimelineChart
-        {props.rows?.map((row: any) => (
+        {renderedProps.rows?.map((row: any) => (
           <div key={row.id}>
             {row.events?.map((event: any) => flattenText(event.body))}
           </div>
@@ -71,6 +81,7 @@ jest.mock('@/components/TimelineChart', () => {
     );
   };
   mockComponent.latestProps = {};
+  mockComponent.latestInstance = Symbol();
 
   const MockTimelineMinimap = function MockTimelineMinimap(props: any) {
     MockTimelineMinimap.latestProps = props;
@@ -135,6 +146,7 @@ const mockUseOffsetPaginatedQuery = useOffsetPaginatedQuery as jest.Mock;
 const mockUseRowWhere = useRowWhere as jest.Mock;
 const mockUseColumns = useColumns as jest.Mock;
 const MockTimelineChart = TimelineChart as any;
+const MockTimelineMinimap = TimelineMinimap as any;
 
 // Mirrors useColumns, which is disabled, so never loading, without a table.
 const setupColumnsMock = (state: { data?: object[]; isLoading?: boolean }) =>
@@ -321,6 +333,58 @@ describe('DBTraceWaterfallChartContainer', () => {
   };
 
   // Test cases
+  it('keeps the same chart mounted while preparing large collapsed and filtered views', async () => {
+    const limit = jest.replaceProperty(
+      jest.requireMock('@/components/traceWaterfallLimits'),
+      'TRACE_WATERFALL_ROW_LIMIT',
+      2000,
+    );
+    const fetchLimit = jest.replaceProperty(
+      jest.requireMock('@/components/traceWaterfallLimits'),
+      'TRACE_WATERFALL_FETCH_LIMIT',
+      2001,
+    );
+    try {
+      const rows = Array.from({ length: 1002 }, (_, i) => ({
+        ...mockTraceData.data[0],
+        SpanId: 'span-' + i,
+        ParentSpanId: i % 10 === 0 ? '' : 'span-' + Math.floor(i / 10) * 10,
+      }));
+      mockUseRowWhere.mockReturnValue((row: SpanRow) => ({
+        where: 'span:' + row.SpanId,
+        aliasWith: [],
+      }));
+      setupQueryMocks({
+        traceData: { ...mockTraceData, data: rows },
+        logData: emptyData,
+      });
+      renderComponent();
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(1002),
+      );
+      const instance = MockTimelineChart.latestInstance;
+      await userEvent.click(screen.getByLabelText('Collapse all'));
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(101),
+      );
+      expect(MockTimelineChart.latestInstance).toBe(instance);
+      await userEvent.click(screen.getByLabelText('Expand all'));
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(1002),
+      );
+      expect(MockTimelineChart.latestInstance).toBe(instance);
+      await userEvent.click(screen.getByTestId('show-logs-chip'));
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(1002),
+      );
+      expect(MockTimelineChart.latestInstance).toBe(instance);
+      expect(screen.queryByText('Loading Traces...')).not.toBeInTheDocument();
+    } finally {
+      limit.restore();
+      fetchLimit.restore();
+    }
+  });
+
   it('renders loading state when data is being fetched', () => {
     mockUseOffsetPaginatedQuery.mockReturnValue({
       data: undefined,
@@ -353,6 +417,99 @@ describe('DBTraceWaterfallChartContainer', () => {
     expect(MockTimelineChart.latestProps.rows.length).toBe(2);
     expect(MockTimelineChart.latestProps.rows[0]).toBeTruthy(); // Trace row
     expect(MockTimelineChart.latestProps.rows[1]).toBeTruthy(); // Log row
+  });
+
+  it('merges 200,000 correlated-log highlights without overflowing the argument stack', async () => {
+    const logHighlights = Array.from({ length: 200_000 }, (_, i) => ({
+      displayedKey: 'EventId',
+      value: String(i).padStart(6, '0'),
+      sql: 'EventId',
+      lucene: undefined,
+      source: mockLogTableSource,
+    }));
+    const extract = jest
+      .spyOn(highlightedAttributes, 'getHighlightedAttributesFromData')
+      .mockImplementation(source =>
+        source.kind === SourceKind.Log
+          ? logHighlights
+          : [
+              {
+                displayedKey: 'Application',
+                value: 'api',
+                sql: 'Application',
+                lucene: undefined,
+                source: mockTraceTableSource,
+              },
+            ],
+      );
+    try {
+      setupQueryMocks({ traceData: mockTraceData, logData: mockLogData });
+      renderComponent();
+      await waitForLoading();
+      expect(screen.getByText('Application: api')).toBeInTheDocument();
+      expect(screen.getByText('EventId: 000000')).toBeInTheDocument();
+      expect(screen.getByText('Show 199989 More...')).toBeInTheDocument();
+    } finally {
+      extract.mockRestore();
+    }
+  });
+
+  it('updates and clears the minimap selection without rebuilding its base rows', async () => {
+    setupQueryMocks({ traceData: mockTraceData });
+    const view = renderComponent(null, mockTraceId, {
+      highlightedRowWhere: 'row-id',
+    });
+    await waitForLoading();
+    const baseRows = MockTimelineMinimap.latestProps.rows;
+    expect(MockTimelineMinimap.latestProps.highlightedRow).toMatchObject({
+      index: 0,
+      events: [
+        {
+          backgroundColor:
+            MockTimelineChart.latestProps.rows[0].events[0].backgroundColor,
+        },
+      ],
+    });
+    view.rerender(
+      <TestProviders>
+        <RowSidePanelContext value={{}}>
+          <DBTraceWaterfallChartContainer
+            traceTableSource={mockTraceTableSource}
+            logTableSource={null}
+            traceId={mockTraceId}
+            dateRange={mockDateRange}
+            focusDate={mockFocusDate}
+            highlightedRowWhere="missing-row"
+          />
+        </RowSidePanelContext>
+      </TestProviders>,
+    );
+    expect(MockTimelineMinimap.latestProps.highlightedRow).toBeUndefined();
+    expect(MockTimelineMinimap.latestProps.rows).toBe(baseRows);
+  });
+
+  it('removes a collapsed child highlight and restores it when expanded', async () => {
+    mockUseRowWhere.mockReturnValue((row: { SpanId: string }) => ({
+      where: row.SpanId,
+      aliasWith: [],
+    }));
+    setupQueryMocks({
+      traceData: {
+        ...mockTraceData,
+        data: [
+          { ...mockTraceData.data[0], SpanId: 'root', ParentSpanId: '' },
+          { ...mockTraceData.data[0], SpanId: 'child', ParentSpanId: 'root' },
+        ],
+      },
+    });
+    renderComponent(null, mockTraceId, { highlightedRowWhere: 'child' });
+    await waitForLoading();
+    expect(MockTimelineMinimap.latestProps.highlightedRow?.index).toBe(1);
+    await userEvent.click(screen.getByLabelText('Collapse all'));
+    expect(MockTimelineMinimap.latestProps.highlightedRow).toBeUndefined();
+    expect(MockTimelineMinimap.latestProps.rows).toHaveLength(1);
+    await userEvent.click(screen.getByLabelText('Expand all'));
+    expect(MockTimelineMinimap.latestProps.highlightedRow?.index).toBe(1);
   });
 
   it.each([
@@ -683,7 +840,8 @@ describe('DBTraceWaterfallChartContainer', () => {
     };
     setupQueryMocks({ traceData: invalid });
     renderComponent(null);
-    await waitForLoading();
+    await screen.findByText('No matching spans or logs found');
+    expect(screen.queryByTestId('timeline-chart')).not.toBeInTheDocument();
 
     expect(screen.queryByTestId('trace-total-stats')).not.toBeInTheDocument();
   });
@@ -1189,11 +1347,11 @@ describe('DBTraceWaterfallChartContainer', () => {
     });
 
     it('renders the log rows the hook keeps', async () => {
-      mockUseBrowserTraceEvents.mockImplementation(() => ({
+      mockUseBrowserTraceEvents.mockReturnValue({
         logRows: [],
         resourceTimingBySpanId: new Map(),
         triggerRow: undefined,
-      }));
+      });
       setupQueryMocks({ traceData: mockTraceData, logData: mockLogData });
       renderComponent();
       await waitForLoading();
@@ -1481,6 +1639,71 @@ describe('useEventsAroundFocus', () => {
     },
   );
 
+  it('limits cached waterfall attributes and releases inactive windows', () => {
+    testEventsAroundFocus({});
+    for (const [, options] of mockUseOffsetPaginatedQuery.mock.calls) {
+      expect(options.gcTime).toBe(0);
+      expect(options.resultTransform.cacheKey).toBe('waterfall-attributes-v1');
+    }
+  });
+
+  it.each([
+    { sqlExpression: 'SpanAttributes' },
+    { sqlExpression: 'CustomAttributes', alias: 'SpanAttributes' },
+  ])(
+    'preserves whole attribute maps when explicitly highlighted (%p)',
+    attribute => {
+      testEventsAroundFocus({
+        tableSource: {
+          ...mockTableSource,
+          highlightedTraceAttributeExpressions: [attribute],
+        },
+      });
+      for (const [, options] of mockUseOffsetPaginatedQuery.mock.calls)
+        expect(options.resultTransform).toBeUndefined();
+    },
+  );
+
+  it('buffers both waterfall query windows until their complete pages arrive', () => {
+    testEventsAroundFocus({});
+    expect(
+      mockUseOffsetPaginatedQuery.mock.calls.map(
+        ([, options]) => options.enableStreaming,
+      ),
+    ).toEqual([false, false]);
+  });
+
+  it.each([
+    { enableStreaming: undefined, expected: true },
+    { enableStreaming: false, expected: false },
+  ])(
+    'preserves streaming for shared event lookups by default ($enableStreaming)',
+    ({ enableStreaming, expected }) => {
+      mockUseOffsetPaginatedQuery
+        .mockReset()
+        .mockReturnValue({ data: undefined, isFetching: false });
+      renderHook(() =>
+        useEventsData({
+          config: {
+            from: mockTableSource.from,
+            connection: mockTableSource.connection,
+            timestampValueExpression: mockTableSource.timestampValueExpression,
+            select: [{ valueExpression: 'SessionId' }],
+            where: "TraceId = 'test-trace-id'",
+          },
+          dateRangeStartInclusive: true,
+          dateRange: mockDateRange,
+          enabled: true,
+          enableStreaming,
+        }),
+      );
+      expect(mockUseOffsetPaginatedQuery).toHaveBeenCalledWith(
+        expect.anything(),
+        { enabled: true, enableStreaming: expected },
+      );
+    },
+  );
+
   it('fetches events before and after focus date', () => {
     const mockBeforeData = {
       data: [{ Body: 'before focus' }],
@@ -1510,6 +1733,43 @@ describe('useEventsAroundFocus', () => {
     expect(result.rows.length).toBe(2);
     expect((result.rows[0] as any).Body).toBe('before focus');
     expect((result.rows[1] as any).Body).toBe('after focus');
+  });
+
+  it('reuses a completed window when the other window arrives with equivalent metadata', () => {
+    const getRowWhere = jest.fn((row: { Body: string }) => ({
+      where: row.Body,
+      aliasWith: [],
+    }));
+    mockUseRowWhere.mockReturnValue(getRowWhere);
+    let beforeData:
+      | { data: { Body: string }[]; meta: { name: string; type: string }[] }
+      | undefined = undefined;
+    const afterData = {
+      data: [{ Body: 'after' }],
+      meta: [{ name: 'Body', type: 'String' }],
+    };
+    mockUseOffsetPaginatedQuery.mockImplementation(query => ({
+      data: query.dateRangeStartInclusive ? beforeData : afterData,
+      isFetching: false,
+    }));
+    const { result, rerender } = renderHook(() =>
+      useEventsAroundFocus({
+        tableSource: mockTableSource,
+        focusDate: mockFocusDate,
+        dateRange: mockDateRange,
+        traceId: mockTraceId,
+        enabled: true,
+      }),
+    );
+    const completedRow = result.current.rows[0];
+    expect(getRowWhere).toHaveBeenCalledTimes(1);
+    beforeData = {
+      data: [{ Body: 'before' }],
+      meta: [{ name: 'Body', type: 'String' }],
+    };
+    rerender();
+    expect(getRowWhere).toHaveBeenCalledTimes(2);
+    expect(result.current.rows[1]).toBe(completedRow);
   });
 
   it('handles empty data correctly', () => {

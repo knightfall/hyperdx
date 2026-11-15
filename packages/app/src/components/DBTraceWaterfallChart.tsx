@@ -1,10 +1,7 @@
 import { ReactNode, useCallback, useMemo, useState } from 'react';
-import _, { omit } from 'lodash';
 import { useForm } from 'react-hook-form';
 import SqlString from 'sqlstring';
-import TimestampNano from 'timestamp-nano';
 import { tcFromSource } from '@hyperdx/common-utils/dist/core/metadata';
-import { isErrorStatusCode } from '@hyperdx/common-utils/dist/core/spanPredicates';
 import {
   ChartConfig,
   ChartConfigWithDateRange,
@@ -18,7 +15,6 @@ import {
   ActionIcon,
   Anchor,
   Box,
-  Center,
   Chip,
   Code,
   Group,
@@ -28,14 +24,10 @@ import {
 } from '@mantine/core';
 import { useElementSize } from '@mantine/hooks';
 import {
-  IconAlertCircleFilled,
-  IconAlertTriangleFilled,
   IconChevronDown,
   IconChevronRight,
   IconChevronsDown,
   IconChevronsRight,
-  IconLogs,
-  IconPointer,
 } from '@tabler/icons-react';
 
 import { ContactSupportText } from '@/components/ContactSupportText';
@@ -59,7 +51,7 @@ import {
   RowHighlightHint,
   useRowHighlightHint,
 } from '@/hooks/useRowHighlightHint';
-import useRowWhere, { WithClause } from '@/hooks/useRowWhere';
+import type { WithClause } from '@/hooks/useRowWhere';
 import useWaterfallSearchState from '@/hooks/useWaterfallSearchState';
 import {
   getDisplayedTimestampValueExpression,
@@ -68,27 +60,32 @@ import {
   getSpanEventBody,
 } from '@/source';
 import { useFormatTime } from '@/useFormatTime';
-import {
-  CATEGORICAL_PALETTE_TOKENS,
-  COLORS,
-  formatDurationMs,
-  getChartColorError,
-  getChartColorSuccess,
-  getChartColorSuccessHighlight,
-  getChartColorWarning,
-  getLogSeverityLevel,
-  parseTimestampToMs,
-} from '@/utils';
+import { CATEGORICAL_PALETTE_TOKENS, COLORS, formatDurationMs } from '@/utils';
 import {
   getHighlightedAttributesFromData,
   getSelectExpressionsForHighlightedAttributes,
 } from '@/utils/highlightedAttributes';
-import { getHttpUrl } from '@/utils/httpUrl';
-import { isRpcSpan } from '@/utils/rpcSpanAttributes';
 
 import { DBHighlightedAttributesList } from './DBHighlightedAttributesList';
+import { waterfallResultTransform } from './traceWaterfallAttributes';
+import {
+  buildWaterfallTree,
+  createSortedWaterfallRows,
+  createWaterfallTree,
+  getDescendantIds,
+  getWaterfallTimestamp,
+} from './traceWaterfallData';
+import {
+  createWaterfallView,
+  getRowSeverity,
+  getWaterfallTimelineRow,
+  type WaterfallRow,
+} from './traceWaterfallModel';
+import { renderWaterfallRow } from './traceWaterfallRow';
+import useWaterfallQueryRows from './useWaterfallQueryRows';
+import useWaterfallTask from './useWaterfallTask';
 
-import styles from '@/../styles/LogSidePanel.module.scss';
+export { getDescendantIds } from './traceWaterfallData';
 
 export type SpanRow = {
   Body: string;
@@ -112,55 +109,6 @@ export type SpanRow = {
   triggeredBy?: string;
 };
 
-type TimestampedRow = {
-  Timestamp: string;
-};
-
-// Bar background color. Error spans and logs are red, other correlated log rows
-// are green (success), and every other span takes its per-service color.
-function barColor(condition: {
-  isHighlighted: boolean;
-  isError?: boolean;
-  type: string | undefined;
-  serviceColor?: string;
-}) {
-  const { isHighlighted, isError, type, serviceColor } = condition;
-
-  if (type === SourceKind.Log && !isError) {
-    return isHighlighted
-      ? getChartColorSuccessHighlight()
-      : getChartColorSuccess();
-  }
-
-  if (isError) {
-    return isHighlighted
-      ? `color-mix(in srgb, ${getChartColorError()} 60%, white)`
-      : getChartColorError();
-  }
-
-  if (serviceColor) {
-    return isHighlighted
-      ? `color-mix(in srgb, ${serviceColor} 60%, white)`
-      : serviceColor;
-  }
-
-  return isHighlighted ? '#A9AFB7' : '#6A7077';
-}
-
-// Shared by the error count and the row icons so the two can't disagree.
-// OTel spans have no severity; they report errors through StatusCode.
-function getRowSeverity(
-  row: Pick<SpanRow, 'type' | 'StatusCode' | 'SeverityNumber' | 'SeverityText'>,
-): 'error' | 'warn' | undefined {
-  if (row.type === SourceKind.Log) {
-    return getLogSeverityLevel({
-      severityNumber: row.SeverityNumber,
-      severityText: row.SeverityText,
-    });
-  }
-  return isErrorStatusCode(row.StatusCode) ? 'error' : undefined;
-}
-
 // Per-service span palette: the full categorical palette minus the two hues we
 // reserve for semantics — green (correlated log rows) and red (errors) —
 // so a service color is never confused with a log or an error. Index-aligned
@@ -174,6 +122,8 @@ const SERVICE_COLORS = COLORS.filter(
 // Stable empty fallback. `data ?? []` would allocate a new array every render
 // and invalidate every memo downstream of the waterfall rows.
 const EMPTY_ROWS: Record<string, any>[] = [];
+const EMPTY_WATERFALL_ROWS: WaterfallRow[] = [];
+const EMPTY_TREE = buildWaterfallTree<WaterfallRow>([], new Set());
 
 export function TraceTotalDurationStat({
   totalDurationMs,
@@ -376,11 +326,18 @@ export function useEventsData({
   dateRangeStartInclusive,
   dateRange,
   enabled,
+  enableStreaming = true,
+  queryOptions,
 }: {
   config: ChartConfig;
   dateRangeStartInclusive: boolean;
   dateRange: [Date, Date];
   enabled: boolean;
+  enableStreaming?: boolean;
+  queryOptions?: Pick<
+    NonNullable<Parameters<typeof useOffsetPaginatedQuery>[1]>,
+    'resultTransform' | 'gcTime'
+  >;
 }) {
   const query: ChartConfigWithDateRange = useMemo(() => {
     return {
@@ -389,7 +346,11 @@ export function useEventsData({
       dateRangeStartInclusive,
     };
   }, [config, dateRange, dateRangeStartInclusive]);
-  return useOffsetPaginatedQuery(query, { enabled });
+  return useOffsetPaginatedQuery(query, {
+    ...queryOptions,
+    enabled,
+    enableStreaming,
+  });
 }
 
 export function useEventsAroundFocus({
@@ -430,6 +391,19 @@ export function useEventsAroundFocus({
     ],
   );
 
+  const queryOptions = useMemo(
+    () => ({
+      // Explicitly highlighted whole-attribute maps must stay available to the label.
+      resultTransform: getSelectExpressionsForHighlightedAttributes(
+        tableSource.highlightedTraceAttributeExpressions,
+      ).some(column => column.alias === 'SpanAttributes')
+        ? undefined
+        : waterfallResultTransform,
+      gcTime: 0,
+    }),
+    [tableSource.highlightedTraceAttributeExpressions],
+  );
+
   const {
     data: beforeSpanData,
     isFetching: isBeforeSpanFetching,
@@ -439,6 +413,8 @@ export function useEventsAroundFocus({
     dateRangeStartInclusive: true,
     dateRange: [dateRange[0], focusDate],
     enabled,
+    enableStreaming: false,
+    queryOptions,
   });
 
   const {
@@ -450,6 +426,8 @@ export function useEventsAroundFocus({
     dateRangeStartInclusive: false,
     dateRange: [focusDate, dateRange[1]],
     enabled,
+    enableStreaming: false,
+    queryOptions,
   });
 
   const isFetching = isBeforeSpanFetching || isAfterSpanFetching;
@@ -477,49 +455,30 @@ export function useEventsAroundFocus({
     };
   }, [beforeData, afterData]);
 
-  const getRowWhere = useRowWhere({ meta, aliasMap: alias });
-  const rows = useMemo(() => {
-    // Sometimes meta has not loaded yet
-    // DO NOT REMOVE, useRowWhere will error if no meta
-    if (!meta || meta.length === 0) return [];
-    return [...trimmedBefore, ...trimmedAfter].map(cd => {
-      // Omit SpanAttributes, SpanEvents, __hdx_hidden and SeverityNumber from rowWhere id generation.
-      // SpanAttributes and SpanEvents can be large objects, and __hdx_hidden may be a lucene expression.
-      // SeverityNumber is only selected when the column exists; leaving it out keeps row ids stable.
-      const rowWhereResult = getRowWhere(
-        omit(cd, [
-          'SpanAttributes',
-          'SpanEvents',
-          '__hdx_hidden',
-          'SeverityNumber',
-        ]),
-      );
-
-      return {
-        // Keep all fields available for display
-        ...cd,
-        // Named fields are repeated for typing. Spreading Record<string, any>
-        // drops the index signature once explicit keys are set, so Duration
-        // would otherwise be missing from the row type.
-        Timestamp: cd?.Timestamp,
-        SpanId: cd?.SpanId,
-        ParentSpanId: cd?.ParentSpanId,
-        Duration: cd?.Duration,
-        __hdx_hidden: cd?.__hdx_hidden,
-        type,
-        id: rowWhereResult.where,
-        // Don't pass aliasWith for trace waterfall chart - the WHERE clause already uses
-        // raw column expressions (e.g., SpanName='value'), and the aliasMap creates
-        // redundant WITH clauses like (Timestamp) AS Timestamp that interfere with queries.
-        aliasWith: [],
-      };
-    });
-  }, [trimmedAfter, trimmedBefore, meta, getRowWhere, type]);
+  const before = useWaterfallQueryRows(
+    trimmedBefore,
+    beforeSpanData?.meta,
+    alias,
+    type,
+  );
+  const after = useWaterfallQueryRows(
+    trimmedAfter,
+    afterSpanData?.meta,
+    alias,
+    type,
+  );
+  const rows = useMemo(
+    () => [
+      ...(before.value ?? EMPTY_WATERFALL_ROWS),
+      ...(after.value ?? EMPTY_WATERFALL_ROWS),
+    ],
+    [before.value, after.value],
+  );
 
   return {
     rows,
     meta,
-    isFetching,
+    isFetching: isFetching || before.isPreparing || after.isPreparing,
     error,
     isTruncated,
   };
@@ -558,27 +517,6 @@ function useFilteredEventsAroundFocus(
     fatalError: filtered.error,
     isTruncated: filtered.isTruncated,
   };
-}
-
-export function getDescendantIds(node: {
-  id?: string;
-  children?: Array<{ id?: string; children?: any[] }>;
-}): string[] {
-  const ids: string[] = [];
-
-  if (!node.children?.length) {
-    return ids;
-  }
-
-  for (const child of node.children) {
-    if (child.id) {
-      ids.push(child.id);
-    }
-
-    ids.push(...getDescendantIds(child));
-  }
-
-  return ids;
 }
 
 /** "Collapse all": every collapsible parent, at every level, becomes collapsed. */
@@ -663,7 +601,6 @@ export function computeToggleCollapse(
   return next;
 }
 
-// TODO: Optimize with ts lookup tables
 export function DBTraceWaterfallChartContainer({
   traceTableSource,
   logTableSource,
@@ -760,7 +697,7 @@ export function DBTraceWaterfallChartContainer({
   }, [clearFilters, setValue]);
 
   const {
-    rows: traceRowsData,
+    rows: fetchedTraceRows,
     isFetching: traceIsFetching,
     meta: traceRowsMeta,
     filterError: traceFilterError,
@@ -809,7 +746,12 @@ export function DBTraceWaterfallChartContainer({
     selectSeverityNumber: hasSeverityNumber,
   });
 
-  const isFetching = traceIsFetching || logIsFetching || isLogColumnsLoading;
+  const isQueryFetching =
+    traceIsFetching || logIsFetching || isLogColumnsLoading;
+  // The chart is hidden until every window completes; avoid building partial trees.
+  const traceRowsData = isQueryFetching
+    ? EMPTY_WATERFALL_ROWS
+    : fetchedTraceRows;
   // Only a fatal trace failure (bad source / connection) blanks the waterfall.
   // A *filter* error on either side is non-fatal: the offending query falls back
   // to unfiltered data and the error is surfaced inline next to its input, so a
@@ -830,7 +772,7 @@ export function DBTraceWaterfallChartContainer({
     triggerRow,
   } = useBrowserTraceEvents({
     traceRows: traceRowsData,
-    logRows: fetchedLogRows,
+    logRows: isQueryFetching ? EMPTY_WATERFALL_ROWS : fetchedLogRows,
     logSource: logTableSource,
     traceId,
     highlightedRowWhere,
@@ -842,34 +784,28 @@ export function DBTraceWaterfallChartContainer({
     enabled: !traceIsFetching,
   });
 
-  const rows: any[] = useMemo(() => {
-    // The trigger row goes first so a click with the same timestamp as the
-    // root span sorts before it (the sort is stable).
-    const nextRows: TimestampedRow[] = [
-      ...(triggerRow ? [triggerRow] : []),
-      ...traceRowsData,
-      ...logRowsData,
-    ];
-    nextRows.sort((a, b) => {
-      const aDate = TimestampNano.fromString(a.Timestamp);
-      const bDate = TimestampNano.fromString(b.Timestamp);
-      const secDiff = aDate.getTimeT() - bDate.getTimeT();
-      if (secDiff === 0) {
-        return aDate.getNano() - bDate.getNano();
-      } else {
-        return secDiff;
-      }
-    });
-
-    return nextRows;
-  }, [triggerRow, traceRowsData, logRowsData]);
+  const sortRows = useCallback(
+    () =>
+      createSortedWaterfallRows<WaterfallRow>([
+        ...(triggerRow ? [triggerRow] : []),
+        ...traceRowsData,
+        ...logRowsData,
+      ]),
+    [triggerRow, traceRowsData, logRowsData],
+  );
+  const sorted = useWaterfallTask(
+    sortRows,
+    traceRowsData.length + logRowsData.length,
+  );
+  const rows = sorted.value ?? EMPTY_WATERFALL_ROWS;
 
   const validSpanIDs = useMemo(() => {
-    return new Set(
-      traceRowsData // only spans in traces can define valid span ids
-        ?.filter(row => _.isString(row.SpanId) && row.SpanId.length > 0)
-        .map(row => row.SpanId) ?? [],
-    );
+    const ids = new Set<string>();
+    for (const row of traceRowsData) {
+      if (typeof row.SpanId === 'string' && row.SpanId.length > 0)
+        ids.add(row.SpanId);
+    }
+    return ids;
   }, [traceRowsData]);
 
   const traceExtent = useMemo(() => {
@@ -889,14 +825,14 @@ export function DBTraceWaterfallChartContainer({
       // stretch the envelope. Skip those before parsing.
       if (
         typeof row.Timestamp !== 'string' ||
-        Number.isNaN(Date.parse(row.Timestamp))
+        !getWaterfallTimestamp(row).isValidDate
       ) {
         continue;
       }
 
       let startMs: number;
       try {
-        startMs = parseTimestampToMs(row.Timestamp);
+        startMs = getWaterfallTimestamp(row).milliseconds;
       } catch {
         continue;
       }
@@ -931,21 +867,21 @@ export function DBTraceWaterfallChartContainer({
   // Map each distinct span service to a stable color. Sorting the names first
   // keeps a service's color stable across renders regardless of row ordering.
   const serviceColorMap = useMemo(() => {
-    const serviceNames = [
-      ...new Set(
-        rows
-          .filter(
-            r =>
-              r.ServiceName &&
-              r.type !== SourceKind.Log &&
-              typeof r.ServiceName === 'string',
-          )
-          .map(r => r.ServiceName),
-      ),
-    ].sort();
+    const names = new Set<string>();
+    for (const row of rows) {
+      if (
+        row.type !== SourceKind.Log &&
+        typeof row.ServiceName === 'string' &&
+        row.ServiceName
+      ) {
+        names.add(row.ServiceName);
+      }
+    }
+    const serviceNames = [...names].sort();
 
     const map = new Map<string, string>();
     serviceNames.forEach((name, i) => {
+      if (!name) return;
       map.set(name, SERVICE_COLORS[i % SERVICE_COLORS.length]);
     });
     return map;
@@ -956,7 +892,7 @@ export function DBTraceWaterfallChartContainer({
       row => !row.__hdx_hidden,
     );
 
-    const attributes = getHighlightedAttributesFromData(
+    let attributes = getHighlightedAttributesFromData(
       traceTableSource,
       traceTableSource.highlightedTraceAttributeExpressions,
       visibleTraceRowsData,
@@ -966,8 +902,8 @@ export function DBTraceWaterfallChartContainer({
     if (logTableSource && logRowsData && logRowsMeta) {
       const visibleLogRowsData = logRowsData?.filter(row => !row.__hdx_hidden);
 
-      attributes.push(
-        ...getHighlightedAttributesFromData(
+      attributes = attributes.concat(
+        getHighlightedAttributesFromData(
           logTableSource,
           logTableSource.highlightedTraceAttributeExpressions,
           visibleLogRowsData,
@@ -998,129 +934,41 @@ export function DBTraceWaterfallChartContainer({
     onClick,
   });
 
-  // 3 Edge-cases
-  // 1. No spans, just logs (ex. sampling)
-  // 2. Spans, but with missing spans inbetween (ex. missing intermediary spans)
-  // 3. Spans, with multiple root nodes (ex. somehow disjoint traces fe/be)
-
-  // Parse out a DAG of spans
-  type Node = SpanRow & {
-    id: string;
-    parentId: string;
-    children: SpanRow[];
-    aliasWith: WithClause[];
-  };
-
-  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
-
-  const { nodesMap, flattenedNodes, parentIdsByLevel } = useMemo(() => {
-    const rootNodes: Node[] = [];
-    const nodesMap = new Map(); // Maps result.id (or placeholder id) -> Node
-    const spanIdMap = new Map(); // Maps SpanId -> result.id of FIRST node with that SpanId
-
-    for (const result of rows ?? []) {
-      const { type, SpanId, ParentSpanId } = result;
-      // A span without an id can't be placed; a log without one still belongs
-      // to the trace.
-      if (!SpanId && type !== SourceKind.Log) continue;
-
-      // log have duplicate span id, tag it with -log
-      const nodeSpanId = type === SourceKind.Log ? `${SpanId}-log` : SpanId; // prevent log spanId overwrite trace spanId
-      const nodeParentSpanId =
-        type === SourceKind.Log ? SpanId : ParentSpanId || '';
-
-      const curNode = {
-        ...result,
-        children: [],
-      };
-
-      if (type === SourceKind.Trace) {
-        // Check if this is the first node with this SpanId
-        if (!spanIdMap.has(nodeSpanId)) {
-          // First occurrence - this becomes the canonical node for this SpanId
-          spanIdMap.set(nodeSpanId, result.id);
-
-          // Check if there's a placeholder parent waiting for this SpanId
-          const placeholderId = `placeholder-${nodeSpanId}`;
-          const placeholder = nodesMap.get(placeholderId);
-          if (placeholder) {
-            // Inherit children from placeholder
-            curNode.children = placeholder.children || [];
-            // Remove placeholder
-            nodesMap.delete(placeholderId);
-          }
-        }
-        // Always add to nodesMap with unique result.id
-        nodesMap.set(result.id, curNode);
-      }
-
-      // Root when the parent isn't a span in this trace, including a log whose
-      // span was never exported (e.g. the process crashed before ending it).
-      const isRootNode =
-        !nodeParentSpanId || !validSpanIDs.has(nodeParentSpanId);
-
-      if (isRootNode) {
-        rootNodes.push(curNode);
-      } else {
-        // Look up parent by SpanId
-        const parentResultId = spanIdMap.get(nodeParentSpanId);
-        let parentNode = parentResultId
-          ? nodesMap.get(parentResultId)
-          : undefined;
-
-        if (!parentNode) {
-          // Parent doesn't exist yet, create placeholder
-          const placeholderId = `placeholder-${nodeParentSpanId}`;
-          parentNode = nodesMap.get(placeholderId);
-          if (!parentNode) {
-            parentNode = { children: [] } as any;
-            nodesMap.set(placeholderId, parentNode);
-          }
-        }
-
-        parentNode.children.push(curNode);
-      }
-    }
-
-    // Build a map of level → parent node IDs (nodes that have children) so the
-    // depth controls can expand/collapse a whole level at a time.
-    const parentIdsByLevel = new Map<number, Set<string>>();
-    const collectParents = (node: any, level: number) => {
-      if (node.children?.length > 0 && node.id) {
-        if (!parentIdsByLevel.has(level)) {
-          parentIdsByLevel.set(level, new Set());
-        }
-        parentIdsByLevel.get(level)!.add(node.id);
-      }
-      node.children?.forEach((child: any) => collectParents(child, level + 1));
-    };
-    rootNodes.forEach(root => collectParents(root, 0));
-
-    type NodeWithLevel = Node & { level: number };
-    // flatten the rootnode dag into an array via in-order traversal
-    const traverse = (node: Node, arr: NodeWithLevel[], level = 0) => {
-      // Filter out hidden nodes, but still traverse their (non-hidden) descendants
-      if (!node.__hdx_hidden) {
-        arr.push({
-          level,
-          ...node,
-        });
-      }
-
-      // Filter out collapsed nodes
-      if (collapsedIds.has(node.id)) {
-        return;
-      }
-      node?.children?.forEach((child: any) => traverse(child, arr, level + 1));
-    };
-
-    const flattenedNodes: NodeWithLevel[] = [];
-    if (rootNodes.length > 0) {
-      rootNodes.forEach(rootNode => traverse(rootNode, flattenedNodes));
-    }
-
-    return { nodesMap, flattenedNodes, parentIdsByLevel };
-  }, [collapsedIds, rows, validSpanIDs]);
+  const [collapsedIds, setCollapsedIds] = useState(() => new Set<string>());
+  const prepareTree = useCallback(
+    () => createWaterfallTree(rows, validSpanIDs),
+    [rows, validSpanIDs],
+  );
+  const tree = useWaterfallTask(prepareTree, rows.length);
+  const minOffset = rows.length
+    ? getWaterfallTimestamp(rows[0]).milliseconds
+    : 0;
+  const viewScope = useMemo(
+    () => ({ fetchedTraceRows, fetchedLogRows, traceId, isQueryFetching }),
+    [fetchedTraceRows, fetchedLogRows, traceId, isQueryFetching],
+  );
+  const prepareView = useCallback(
+    () =>
+      createWaterfallView(
+        tree.value ?? EMPTY_TREE,
+        collapsedIds,
+        minOffset,
+        serviceColorMap,
+        showSpans,
+        showLogs,
+      ),
+    [tree.value, collapsedIds, minOffset, serviceColorMap, showSpans, showLogs],
+  );
+  const view = useWaterfallTask(prepareView, rows.length, {
+    enabled: !isQueryFetching && !sorted.isPreparing && !tree.isPreparing,
+    retainPreviousFor: viewScope,
+  });
+  const visibleNodes = view.value?.visibleNodes ?? EMPTY_TREE.rootNodes;
+  const timelineRows = view.value?.timelineRows ?? [];
+  const { nodesMap, parentIdsByLevel } = view.value?.tree ?? EMPTY_TREE;
+  const displayMinOffset = view.value?.minOffset ?? 0;
+  const displayServiceColorMap = view.value?.serviceColorMap ?? serviceColorMap;
+  const displayCollapsedIds = view.value?.collapsedIds ?? collapsedIds;
 
   const toggleCollapse = useCallback(
     (id: string, event: React.MouseEvent) => {
@@ -1151,25 +999,17 @@ export function DBTraceWaterfallChartContainer({
 
   const hasCollapsibleNodes = parentIdsByLevel.size > 0;
 
-  const visibleNodes = useMemo(() => {
-    if (showSpans && showLogs) return flattenedNodes;
-    return flattenedNodes.filter(node => {
-      // The click belongs with the spans it started, not with the logs.
-      if (node.triggeredBy) return showSpans;
-      if (node.type === SourceKind.Log) return showLogs;
-      return showSpans;
-    });
-  }, [flattenedNodes, showSpans, showLogs]);
-
-  const spanCount = visibleNodes.filter(
-    node => node.type !== SourceKind.Log,
-  ).length;
-  const logCount = visibleNodes.filter(
-    node => node.type === SourceKind.Log && !node.triggeredBy,
-  ).length;
-  const errorCount = visibleNodes.filter(
-    node => getRowSeverity(node) === 'error',
-  ).length;
+  const { spanCount, logCount, errorCount } = useMemo(() => {
+    let spanCount = 0;
+    let logCount = 0;
+    let errorCount = 0;
+    for (const node of visibleNodes) {
+      if (node.type !== SourceKind.Log) spanCount++;
+      else if (!node.triggeredBy) logCount++;
+      if (getRowSeverity(node) === 'error') errorCount++;
+    }
+    return { spanCount, logCount, errorCount };
+  }, [visibleNodes]);
 
   const countParts: string[] = [];
   if (spanCount > 0) {
@@ -1184,257 +1024,57 @@ export function DBTraceWaterfallChartContainer({
   // TODO: Add duration filter?
   // TODO: Add backend filters for duration and collapsing?
 
-  // All units in ms!
-  const foundMinOffset =
-    rows?.reduce((acc, result) => {
-      return Math.min(acc, parseTimestampToMs(result.Timestamp));
-    }, Number.MAX_SAFE_INTEGER) ?? 0;
-  const minOffset =
-    foundMinOffset === Number.MAX_SAFE_INTEGER ? 0 : foundMinOffset;
-
-  const timelineRows = useMemo(
-    () =>
-      visibleNodes.map(result => {
-        const tookMs = (result.Duration || 0) * 1000;
-        const startOffset = parseTimestampToMs(result.Timestamp);
-        const start = startOffset - minOffset;
-        const end = start + tookMs;
-
-        const {
-          Body: _body,
-          ServiceName: serviceName,
-          id,
-          type,
-          aliasWith,
-          triggeredBy,
-        } = result;
-        let body = `${_body}`;
-        try {
-          body = typeof _body === 'string' ? _body : JSON.stringify(_body);
-        } catch (e) {
-          console.warn(
-            "DBTraceWaterfallChart: Couldn't JSON stringify Body",
-            e,
-          );
-        }
-
-        const spanAttributes = result.SpanAttributes ?? {};
-        const httpUrl = isRpcSpan(spanAttributes)
-          ? undefined
-          : getHttpUrl(spanAttributes);
-        const displayText =
-          triggeredBy ?? (httpUrl ? `${body} ${httpUrl}` : body);
-        const startedAt = !isNaN(startOffset)
-          ? ` | Started at ${formatTime(new Date(startOffset), { format: 'withMs' })}`
-          : '';
-
-        // Process span events into markers (only if showSpanEvents is enabled)
-        const markers = showSpanEvents
-          ? [
-              ...(result.SpanEvents ?? []).map(spanEvent => {
-                const epochMs = parseTimestampToMs(spanEvent.Timestamp);
-                return {
-                  timestamp: epochMs - minOffset,
-                  epochMs,
-                  name: spanEvent.Name,
-                  attributes: spanEvent.Attributes || {},
-                };
-              }),
-              // Log rows carry their parent span's SpanId.
-              ...(type !== SourceKind.Log
-                ? (resourceTimingBySpanId.get(result.SpanId) ?? [])
-                : []
-              ).map(marker => ({
-                ...marker,
-                timestamp: marker.epochMs - minOffset,
-              })),
-            ]
-          : [];
-
-        const severity = getRowSeverity(result);
-        const isError = severity === 'error';
-        const status = result.StatusCode || result.SeverityText;
-        const isWarn = severity === 'warn';
-        const isHighlighted = highlightedRowWhere === id;
-
-        const barBackgroundColor =
-          type === SourceKind.Log
-            ? isError
-              ? getChartColorError()
-              : getChartColorSuccess()
-            : serviceName
-              ? (serviceColorMap.get(serviceName) ?? '#6A7077')
-              : '#6A7077';
-
-        return {
-          id,
-          type,
-          aliasWith,
-          label: (
-            <div
-              className={`${
-                isHighlighted && styles.traceTimelineLabelHighlighted
-              } text-truncate cursor-pointer ps-2 ${styles.traceTimelineLabel}`}
-              role="button"
-              onClick={() => {
-                onClick?.({ id, type: type ?? '', aliasWith });
-              }}
-            >
-              <div className="d-flex align-items-center" style={{ height: 24 }}>
-                {Array.from({ length: result.level }).map((_, index) => (
-                  <div
-                    key={index}
-                    style={{
-                      borderLeft: '1px solid var(--color-border)',
-                      marginLeft: 7,
-                      width: 8,
-                      minWidth: 8,
-                      maxWidth: 8,
-                      flexGrow: 1,
-                      flexShrink: 0,
-                      height: '100%',
-                    }}
-                  ></div>
-                ))}
-
-                <Center
-                  style={{
-                    opacity: result.children.length > 0 ? 1 : 0,
-                  }}
-                  onClick={
-                    result.children.length > 0
-                      ? e => {
-                          toggleCollapse(id, e);
-                        }
-                      : undefined
-                  }
-                >
-                  {collapsedIds.has(id) ? (
-                    <IconChevronRight size={16} className="me-1" />
-                  ) : (
-                    <IconChevronDown size={16} className="me-1" />
-                  )}{' '}
-                </Center>
-
-                <div
-                  style={{
-                    width: 3,
-                    minWidth: 3,
-                    height: 14,
-                    backgroundColor: barBackgroundColor,
-                    borderRadius: 1,
-                    flexShrink: 0,
-                    marginRight: 6,
-                  }}
-                />
-
-                {result.children.length > 0 && (
-                  <Text
-                    span
-                    size="xxs"
-                    c="dimmed"
-                    me={4}
-                    style={{ flexShrink: 0 }}
-                  >
-                    ({result.children.length})
-                  </Text>
-                )}
-
-                {isError && (
-                  <IconAlertCircleFilled
-                    size={12}
-                    className="me-1 flex-shrink-0"
-                    style={{ color: getChartColorError() }}
-                    aria-label="Error"
-                  />
-                )}
-                {isWarn && !isError && (
-                  <IconAlertTriangleFilled
-                    size={12}
-                    className="me-1 flex-shrink-0"
-                    style={{ color: getChartColorWarning() }}
-                    aria-label="Warning"
-                  />
-                )}
-
-                <Group gap={0} wrap="nowrap">
-                  {triggeredBy ? (
-                    <IconPointer
-                      size={14}
-                      className="align-middle me-2"
-                      aria-label="Triggering click"
-                    />
-                  ) : type === SourceKind.Log ? (
-                    <IconLogs
-                      size={14}
-                      className="align-middle me-2"
-                      aria-label="Correlated Log Line"
-                    />
-                  ) : null}
-                  <Text
-                    size="xxs"
-                    truncate="end"
-                    span
-                    title={
-                      triggeredBy ??
-                      `${serviceName}${httpUrl ? ` ${displayText}` : ''}`
-                    }
-                    role="button"
-                  >
-                    {serviceName && <>{serviceName} </>}
-                    <Text span inherit c="dimmed">
-                      {displayText}
-                    </Text>
-                  </Text>
-                </Group>
-              </div>
-            </div>
-          ),
-          isActive: isHighlighted,
-          events: [
-            {
-              id,
-              type,
-              aliasWith,
-              start,
-              end,
-              tooltip: triggeredBy
-                ? `${triggeredBy}${startedAt}`
-                : `${displayText} ${tookMs >= 0 ? `took ${tookMs.toFixed(4)}ms` : ''} ${status ? `| Status: ${status}` : ''}${startedAt}`,
-              color: 'var(--color-text-inverted)',
-              backgroundColor: barColor({
-                isHighlighted,
-                isError,
-                type,
-                serviceColor: serviceName
-                  ? serviceColorMap.get(serviceName)
-                  : undefined,
-              }),
-              body: <span>{displayText}</span>,
-              minWidthPx: type === SourceKind.Log ? 10 : 2,
-              isError,
-              markers,
-              showDuration: type !== SourceKind.Log,
-            },
-          ],
-        };
+  const renderRow = useCallback(
+    (_row: unknown, index: number) =>
+      renderWaterfallRow({
+        result: visibleNodes[index],
+        minOffset: displayMinOffset,
+        formatTime,
+        showSpanEvents,
+        resourceTimingBySpanId,
+        highlightedRowWhere,
+        serviceColorMap: displayServiceColorMap,
+        onClick,
+        toggleCollapse,
+        collapsedIds: displayCollapsedIds,
       }),
     [
-      collapsedIds,
       visibleNodes,
+      displayMinOffset,
       formatTime,
-      highlightedRowWhere,
-      minOffset,
-      onClick,
-      resourceTimingBySpanId,
-      serviceColorMap,
       showSpanEvents,
+      resourceTimingBySpanId,
+      highlightedRowWhere,
+      displayServiceColorMap,
+      onClick,
       toggleCollapse,
+      displayCollapsedIds,
     ],
   );
-  const initialScrollRowIndex = visibleNodes.findIndex(v => {
-    return v.id === highlightedRowWhere;
-  });
+  const initialScrollRowIndex = useMemo(
+    () =>
+      highlightedRowWhere == null
+        ? -1
+        : visibleNodes.findIndex(v => v.id === highlightedRowWhere),
+    [visibleNodes, highlightedRowWhere],
+  );
+  const highlightedMinimapRow = useMemo(() => {
+    if (initialScrollRowIndex < 0) return undefined;
+    return {
+      ...getWaterfallTimelineRow(
+        visibleNodes[initialScrollRowIndex],
+        displayMinOffset,
+        displayServiceColorMap,
+        true,
+      ),
+      index: initialScrollRowIndex,
+    };
+  }, [
+    initialScrollRowIndex,
+    visibleNodes,
+    displayMinOffset,
+    displayServiceColorMap,
+  ]);
 
   const { ref: timelineWrapperRef, height: timelineWrapperHeight } =
     useElementSize();
@@ -1442,13 +1082,18 @@ export function DBTraceWaterfallChartContainer({
   const [viewportController, setViewportController] =
     useState<TimelineViewportController | null>(null);
 
+  const isFetching = isQueryFetching || view.value == null;
   const showMinimap =
     !isFetching && !error && rows != null && visibleNodes.length > 0;
 
   return (
     <>
       {showMinimap && (
-        <TimelineMinimap rows={timelineRows} controller={viewportController} />
+        <TimelineMinimap
+          rows={timelineRows}
+          controller={viewportController}
+          highlightedRow={highlightedMinimapRow}
+        />
       )}
       {isFilterExpanded && (
         <form onSubmit={handleSubmit(onSubmitFilters)}>
@@ -1675,6 +1320,8 @@ export function DBTraceWaterfallChartContainer({
       )}
       <div
         ref={timelineWrapperRef}
+        data-testid="trace-waterfall-viewport"
+        aria-busy={view.isPreparing}
         style={{
           position: 'relative',
           overflow: 'hidden',
@@ -1702,7 +1349,7 @@ export function DBTraceWaterfallChartContainer({
             An unknown error occurred. <ContactSupportText />
           </div>
         ) : visibleNodes.length === 0 ? (
-          flattenedNodes.length > 0 ? (
+          (view.value?.flattenedCount ?? 0) > 0 ? (
             <div className="my-3">All items are hidden by filters</div>
           ) : (
             (emptyState ?? (
@@ -1722,6 +1369,7 @@ export function DBTraceWaterfallChartContainer({
               });
             }}
             rows={timelineRows}
+            renderRow={renderRow}
             initialScrollRowIndex={initialScrollRowIndex}
             onReady={setViewportController}
           />

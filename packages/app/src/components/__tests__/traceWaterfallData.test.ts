@@ -1,0 +1,214 @@
+import TimestampNano from 'timestamp-nano';
+import { SourceKind } from '@hyperdx/common-utils/dist/types';
+
+import {
+  buildWaterfallTree,
+  createSortedWaterfallRows,
+  flattenWaterfallTree,
+  getDescendantIds,
+  parseWaterfallTimestamp,
+  sortWaterfallRows,
+} from '@/components/traceWaterfallData';
+import {
+  TRACE_WATERFALL_FETCH_LIMIT,
+  TRACE_WATERFALL_ROW_LIMIT,
+} from '@/components/traceWaterfallLimits';
+import {
+  createWaterfallView,
+  getWaterfallTimelineRows,
+} from '@/components/traceWaterfallModel';
+import { finishWaterfallTask } from '@/components/waterfallTask';
+
+const row = (id: string, ParentSpanId = '', hidden = false) => ({
+  id,
+  SpanId: id,
+  ParentSpanId,
+  type: SourceKind.Trace,
+  __hdx_hidden: hidden,
+});
+
+it('preserves the 50,000-row cap plus a truncation sentinel per window', () => {
+  expect(TRACE_WATERFALL_ROW_LIMIT).toBe(50_000);
+  expect(TRACE_WATERFALL_FETCH_LIMIT).toBe(50_001);
+});
+
+it('sorts timestamps once per row while preserving nanosecond order and ties', () => {
+  const rows = [
+    { id: 'later', Timestamp: '2024-01-01T00:00:00.000000002Z' },
+    { id: 'trigger', Timestamp: '2024-01-01T00:00:00.000000001Z' },
+    { id: 'span', Timestamp: '2024-01-01T00:00:00.000000001Z' },
+    { id: 'earlier', Timestamp: '2023-12-31T23:59:59.999999999Z' },
+  ];
+  const parse = jest.spyOn(Date, 'parse');
+  expect(sortWaterfallRows(rows).map(row => row.id)).toEqual([
+    'earlier',
+    'trigger',
+    'span',
+    'later',
+  ]);
+  expect(rows[0].id).toBe('later');
+  expect(parse).toHaveBeenCalledTimes(4);
+  parse.mockRestore();
+});
+
+it('prepares timeline positions without reading off-screen span bodies', () => {
+  const tree = buildWaterfallTree(
+    [
+      {
+        ...row('root'),
+        Timestamp: '2024-01-01T00:00:00.001Z',
+        Duration: 0.002,
+        aliasWith: [],
+      },
+    ],
+    new Set(['root']),
+  );
+  const visible = flattenWaterfallTree(tree.rootNodes, new Set());
+  Object.defineProperty(visible[0], 'Body', {
+    get() {
+      throw new Error('Off-screen body was read');
+    },
+  });
+  const rows = getWaterfallTimelineRows(
+    visible,
+    Date.UTC(2024, 0, 1),
+    new Map(),
+  );
+  expect(rows[0]).toMatchObject({
+    id: 'root',
+    label: null,
+    events: [{ start: 1, end: 3, body: null, tooltip: '' }],
+  });
+});
+
+it('flattens 200,000 nested spans and collapses without rebuilding the tree', () => {
+  const rows = Array.from({ length: 200_000 }, (_, i) =>
+    row(String(i), i === 0 ? '' : String(i - 1)),
+  );
+  const tree = buildWaterfallTree(rows, new Set(rows.map(row => row.SpanId)));
+  const expanded = flattenWaterfallTree(tree.rootNodes, new Set());
+  expect(expanded).toHaveLength(200_000);
+  expect(expanded[199_999]).toMatchObject({ id: '199999', level: 199_999 });
+  expect(tree.parentIdsByLevel.get(199_998)).toEqual(new Set(['199998']));
+  expect(flattenWaterfallTree(tree.rootNodes, new Set(['0']))).toMatchObject([
+    { id: '0', level: 0 },
+  ]);
+  const descendants = getDescendantIds(tree.rootNodes[0]);
+  expect(descendants).toHaveLength(199_999);
+  expect(descendants.at(-1)).toBe('199999');
+});
+
+it('handles 200,000 siblings without spreading them onto the call stack', () => {
+  const rows = [
+    row('root'),
+    ...Array.from({ length: 199_999 }, (_, i) => row(String(i), 'root')),
+  ];
+  const tree = buildWaterfallTree(rows, new Set(rows.map(row => row.SpanId)));
+  const expanded = flattenWaterfallTree(tree.rootNodes, new Set());
+  expect(expanded).toHaveLength(200_000);
+  expect(expanded.at(-1)).toMatchObject({ id: '199998', level: 1 });
+  expect(getDescendantIds(tree.rootNodes[0])).toHaveLength(199_999);
+});
+
+it('keeps hidden descendants, late parents, duplicate spans and orphan logs', () => {
+  const rows = [
+    row('child', 'root'),
+    row('root', '', true),
+    { ...row('duplicate'), SpanId: 'root' },
+    { ...row('log', 'ignored'), SpanId: 'root', type: SourceKind.Log },
+    { ...row('orphan'), SpanId: 'missing', type: SourceKind.Log },
+    { ...row('unplaced'), SpanId: '' },
+  ];
+  const tree = buildWaterfallTree(rows, new Set(['root', 'child']));
+  expect(
+    flattenWaterfallTree(tree.rootNodes, new Set()).map(n => n.id),
+  ).toEqual(['child', 'log', 'duplicate', 'orphan']);
+  expect(tree.nodesMap.get('root')?.children.map(n => n.id)).toEqual([
+    'child',
+    'log',
+  ]);
+});
+
+it('keeps exact nanosecond ordering when epoch milliseconds round to the next second', () => {
+  const rows = [
+    { Timestamp: '2024-01-01T00:00:01.000000000Z' },
+    { Timestamp: '2024-01-01T00:00:00.999999999Z' },
+    { Timestamp: '2024-01-01T00:00:00.999999998Z' },
+  ];
+  expect(sortWaterfallRows(rows)).toEqual([rows[2], rows[1], rows[0]]);
+});
+
+it.each([
+  '2024-01-01T00:00:00Z',
+  '2024-01-01T00:00:00.1Z',
+  '2024-01-01T00:00:00.123456789Z',
+  '2024-01-01T11:00:00.123456789+11:00',
+  '1969-12-31T23:59:59.999999999Z',
+])('preserves timestamp-nano precision for %s', value => {
+  const original = TimestampNano.fromString(value);
+  expect(parseWaterfallTimestamp(value)).toMatchObject({
+    seconds: original.getTimeT(),
+    nanos: original.getNano(),
+    milliseconds:
+      original.toDate().getTime() +
+      (original.getNano() % 1_000_000) / 1_000_000,
+  });
+});
+
+it('sorts shuffled chunks stably and yields before the full sort completes', () => {
+  const rows = Array.from({ length: 20_000 }, (_, index) => ({
+    id: index,
+    Timestamp: new Date(Date.UTC(2024, 0, 1) + (index % 101)).toISOString(),
+  })).reverse();
+  const task = createSortedWaterfallRows(rows);
+  expect(task.next().done).toBe(false);
+  let result = task.next();
+  while (!result.done) result = task.next();
+  const expected = [...rows].sort(
+    (a, b) => Date.parse(a.Timestamp) - Date.parse(b.Timestamp),
+  );
+  expect(result.value).toEqual(expected);
+});
+
+it('prepares matching visible rows and timeline positions as one immutable view', () => {
+  const start = Date.UTC(2024, 0, 1);
+  const rows = Array.from({ length: 1002 }, (_, i) => ({
+    ...row(String(i), i % 10 === 0 ? '' : String(Math.floor(i / 10) * 10)),
+    Timestamp: new Date(start + i).toISOString(),
+    Duration: 0.001,
+    aliasWith: [],
+  }));
+  const tree = buildWaterfallTree(rows, new Set(rows.map(row => row.SpanId)));
+  Object.defineProperty(tree.rootNodes[0], 'Body', {
+    get() {
+      throw Error('Off-screen body read');
+    },
+  });
+  const collapsed = new Set(['0']);
+  const colors = new Map<string, string>();
+  const view = finishWaterfallTask(
+    createWaterfallView(tree, collapsed, start, colors, true, true),
+  );
+  expect(view.tree).toBe(tree);
+  expect(view.collapsedIds).toBe(collapsed);
+  expect(view.visibleNodes).toHaveLength(993);
+  expect(view.timelineRows.map(row => row.id)).toEqual(
+    view.visibleNodes.map(row => row.id),
+  );
+  expect(view.visibleNodes[1].id).toBe('10');
+  expect(view.timelineRows[1].events[0].start).toBe(10);
+  const hidden = finishWaterfallTask(
+    createWaterfallView(tree, collapsed, start, colors, false, true),
+  );
+  expect(hidden.visibleNodes).toEqual([]);
+  expect(hidden.timelineRows).toEqual([]);
+  expect(hidden.flattenedCount).toBe(993);
+  expect(tree.rootNodes[0].children).toHaveLength(9);
+});
+
+it('excludes invalid timestamps from sorting and the timeline origin', () => {
+  const valid = { id: 'valid', Timestamp: '2024-01-01T00:00:00.000000001Z' };
+  const invalid = { id: 'invalid', Timestamp: 'not-a-date' };
+  expect(sortWaterfallRows([invalid, valid, invalid])).toEqual([valid]);
+  expect(sortWaterfallRows([invalid])).toEqual([]);
+});
