@@ -7,11 +7,16 @@ import {
   getChartColorSuccess,
   getChartColorSuccessHighlight,
   getLogSeverityLevel,
-  parseTimestampToMs,
 } from '@/utils';
 
 import type { SpanRow } from './DBTraceWaterfallChart';
-import type { WaterfallNode } from './traceWaterfallData';
+import {
+  createWaterfallRows,
+  getWaterfallTimestamp,
+  type WaterfallNode,
+  type WaterfallTimestamp,
+} from './traceWaterfallData';
+import { finishWaterfallTask } from './waterfallTask';
 
 // Bar background color. Error spans and logs are red, other correlated log rows
 // are green (success), and every other span takes its per-service color.
@@ -45,7 +50,11 @@ export function barColor(condition: {
 }
 
 export type WaterfallRow = Pick<SpanRow, 'Timestamp' | 'SpanId'> &
-  Partial<SpanRow> & { id: string; aliasWith: WithClause[] };
+  Partial<SpanRow> & {
+    id: string;
+    aliasWith: WithClause[];
+    __waterfallTimestamp?: WaterfallTimestamp;
+  };
 
 // Shared by the error count and the row icons so the two can't disagree.
 // OTel spans have no severity; they report errors through StatusCode.
@@ -66,9 +75,42 @@ export function getWaterfallTimelineRows(
   minOffset: number,
   serviceColorMap: Map<string, string>,
 ) {
-  return visibleNodes.map(result =>
-    getWaterfallTimelineRow(result, minOffset, serviceColorMap),
+  return finishWaterfallTask(
+    createWaterfallTimelineRows(visibleNodes, minOffset, serviceColorMap),
   );
+}
+
+export function* createWaterfallTimelineRows(
+  visibleNodes: WaterfallNode<WaterfallRow>[],
+  minOffset: number,
+  serviceColorMap: Map<string, string>,
+) {
+  // Semantic colors can read computed styles. Resolve each status/service once.
+  const colors = new Map<string, string>();
+  return yield* createWaterfallRows(visibleNodes, result => {
+    const serviceColor = result.ServiceName
+      ? serviceColorMap.get(result.ServiceName)
+      : undefined;
+    const isError = getRowSeverity(result) === 'error';
+    const key = JSON.stringify([result.type, isError, serviceColor]);
+    let color = colors.get(key);
+    if (!color) {
+      color = barColor({
+        isHighlighted: false,
+        type: result.type,
+        isError,
+        serviceColor,
+      });
+      colors.set(key, color);
+    }
+    return getWaterfallTimelineRow(
+      result,
+      minOffset,
+      serviceColorMap,
+      false,
+      color,
+    );
+  });
 }
 
 export function getWaterfallTimelineRow(
@@ -76,8 +118,9 @@ export function getWaterfallTimelineRow(
   minOffset: number,
   serviceColorMap: Map<string, string>,
   isHighlighted = false,
+  backgroundColor?: string,
 ) {
-  const start = parseTimestampToMs(result.Timestamp) - minOffset;
+  const start = getWaterfallTimestamp(result).milliseconds - minOffset;
   return {
     id: result.id,
     type: result.type,
@@ -90,14 +133,16 @@ export function getWaterfallTimelineRow(
         end: start + (result.Duration || 0) * 1000,
         tooltip: '',
         color: 'var(--color-text-inverted)',
-        backgroundColor: barColor({
-          isHighlighted,
-          isError: getRowSeverity(result) === 'error',
-          type: result.type,
-          serviceColor: result.ServiceName
-            ? serviceColorMap.get(result.ServiceName)
-            : undefined,
-        }),
+        backgroundColor:
+          backgroundColor ??
+          barColor({
+            isHighlighted,
+            isError: getRowSeverity(result) === 'error',
+            type: result.type,
+            serviceColor: result.ServiceName
+              ? serviceColorMap.get(result.ServiceName)
+              : undefined,
+          }),
         body: null,
         minWidthPx: result.type === SourceKind.Log ? 10 : 2,
       },

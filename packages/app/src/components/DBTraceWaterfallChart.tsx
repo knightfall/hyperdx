@@ -1,5 +1,4 @@
 import { ReactNode, useCallback, useMemo, useState } from 'react';
-import _, { omit } from 'lodash';
 import { useForm } from 'react-hook-form';
 import SqlString from 'sqlstring';
 import { tcFromSource } from '@hyperdx/common-utils/dist/core/metadata';
@@ -52,7 +51,7 @@ import {
   RowHighlightHint,
   useRowHighlightHint,
 } from '@/hooks/useRowHighlightHint';
-import useRowWhere, { WithClause } from '@/hooks/useRowWhere';
+import type { WithClause } from '@/hooks/useRowWhere';
 import useWaterfallSearchState from '@/hooks/useWaterfallSearchState';
 import {
   getDisplayedTimestampValueExpression,
@@ -61,12 +60,7 @@ import {
   getSpanEventBody,
 } from '@/source';
 import { useFormatTime } from '@/useFormatTime';
-import {
-  CATEGORICAL_PALETTE_TOKENS,
-  COLORS,
-  formatDurationMs,
-  parseTimestampToMs,
-} from '@/utils';
+import { CATEGORICAL_PALETTE_TOKENS, COLORS, formatDurationMs } from '@/utils';
 import {
   getHighlightedAttributesFromData,
   getSelectExpressionsForHighlightedAttributes,
@@ -75,17 +69,21 @@ import {
 import { DBHighlightedAttributesList } from './DBHighlightedAttributesList';
 import {
   buildWaterfallTree,
-  flattenWaterfallTree,
+  createFlattenedWaterfallRows,
+  createSortedWaterfallRows,
+  createWaterfallTree,
   getDescendantIds,
-  sortWaterfallRows,
+  getWaterfallTimestamp,
 } from './traceWaterfallData';
 import {
+  createWaterfallTimelineRows,
   getRowSeverity,
   getWaterfallTimelineRow,
-  getWaterfallTimelineRows,
   type WaterfallRow,
 } from './traceWaterfallModel';
 import { renderWaterfallRow } from './traceWaterfallRow';
+import useWaterfallQueryRows from './useWaterfallQueryRows';
+import useWaterfallTask from './useWaterfallTask';
 
 export { getDescendantIds } from './traceWaterfallData';
 
@@ -124,6 +122,8 @@ const SERVICE_COLORS = COLORS.filter(
 // Stable empty fallback. `data ?? []` would allocate a new array every render
 // and invalidate every memo downstream of the waterfall rows.
 const EMPTY_ROWS: Record<string, any>[] = [];
+const EMPTY_WATERFALL_ROWS: WaterfallRow[] = [];
+const EMPTY_TREE = buildWaterfallTree<WaterfallRow>([], new Set());
 
 export function TraceTotalDurationStat({
   totalDurationMs,
@@ -431,49 +431,30 @@ export function useEventsAroundFocus({
     };
   }, [beforeData, afterData]);
 
-  const getRowWhere = useRowWhere({ meta, aliasMap: alias });
-  const rows = useMemo(() => {
-    // Sometimes meta has not loaded yet
-    // DO NOT REMOVE, useRowWhere will error if no meta
-    if (!meta || meta.length === 0) return [];
-    return [...trimmedBefore, ...trimmedAfter].map(cd => {
-      // Omit SpanAttributes, SpanEvents, __hdx_hidden and SeverityNumber from rowWhere id generation.
-      // SpanAttributes and SpanEvents can be large objects, and __hdx_hidden may be a lucene expression.
-      // SeverityNumber is only selected when the column exists; leaving it out keeps row ids stable.
-      const rowWhereResult = getRowWhere(
-        omit(cd, [
-          'SpanAttributes',
-          'SpanEvents',
-          '__hdx_hidden',
-          'SeverityNumber',
-        ]),
-      );
-
-      return {
-        // Keep all fields available for display
-        ...cd,
-        // Named fields are repeated for typing. Spreading Record<string, any>
-        // drops the index signature once explicit keys are set, so Duration
-        // would otherwise be missing from the row type.
-        Timestamp: cd?.Timestamp,
-        SpanId: cd?.SpanId,
-        ParentSpanId: cd?.ParentSpanId,
-        Duration: cd?.Duration,
-        __hdx_hidden: cd?.__hdx_hidden,
-        type,
-        id: rowWhereResult.where,
-        // Don't pass aliasWith for trace waterfall chart - the WHERE clause already uses
-        // raw column expressions (e.g., SpanName='value'), and the aliasMap creates
-        // redundant WITH clauses like (Timestamp) AS Timestamp that interfere with queries.
-        aliasWith: [],
-      };
-    });
-  }, [trimmedAfter, trimmedBefore, meta, getRowWhere, type]);
+  const before = useWaterfallQueryRows(
+    trimmedBefore,
+    beforeSpanData?.meta,
+    alias,
+    type,
+  );
+  const after = useWaterfallQueryRows(
+    trimmedAfter,
+    afterSpanData?.meta,
+    alias,
+    type,
+  );
+  const rows = useMemo(
+    () => [
+      ...(before.value ?? EMPTY_WATERFALL_ROWS),
+      ...(after.value ?? EMPTY_WATERFALL_ROWS),
+    ],
+    [before.value, after.value],
+  );
 
   return {
     rows,
     meta,
-    isFetching,
+    isFetching: isFetching || before.isPreparing || after.isPreparing,
     error,
     isTruncated,
   };
@@ -692,7 +673,7 @@ export function DBTraceWaterfallChartContainer({
   }, [clearFilters, setValue]);
 
   const {
-    rows: traceRowsData,
+    rows: fetchedTraceRows,
     isFetching: traceIsFetching,
     meta: traceRowsMeta,
     filterError: traceFilterError,
@@ -741,7 +722,12 @@ export function DBTraceWaterfallChartContainer({
     selectSeverityNumber: hasSeverityNumber,
   });
 
-  const isFetching = traceIsFetching || logIsFetching || isLogColumnsLoading;
+  const isQueryFetching =
+    traceIsFetching || logIsFetching || isLogColumnsLoading;
+  // The chart is hidden until every window completes; avoid building partial trees.
+  const traceRowsData = isQueryFetching
+    ? EMPTY_WATERFALL_ROWS
+    : fetchedTraceRows;
   // Only a fatal trace failure (bad source / connection) blanks the waterfall.
   // A *filter* error on either side is non-fatal: the offending query falls back
   // to unfiltered data and the error is surfaced inline next to its input, so a
@@ -762,7 +748,7 @@ export function DBTraceWaterfallChartContainer({
     triggerRow,
   } = useBrowserTraceEvents({
     traceRows: traceRowsData,
-    logRows: fetchedLogRows,
+    logRows: isQueryFetching ? EMPTY_WATERFALL_ROWS : fetchedLogRows,
     logSource: logTableSource,
     traceId,
     highlightedRowWhere,
@@ -774,22 +760,28 @@ export function DBTraceWaterfallChartContainer({
     enabled: !traceIsFetching,
   });
 
-  const rows = useMemo(
+  const sortRows = useCallback(
     () =>
-      sortWaterfallRows<WaterfallRow>([
+      createSortedWaterfallRows<WaterfallRow>([
         ...(triggerRow ? [triggerRow] : []),
         ...traceRowsData,
         ...logRowsData,
       ]),
     [triggerRow, traceRowsData, logRowsData],
   );
+  const sorted = useWaterfallTask(
+    sortRows,
+    traceRowsData.length + logRowsData.length,
+  );
+  const rows = sorted.value ?? EMPTY_WATERFALL_ROWS;
 
   const validSpanIDs = useMemo(() => {
-    return new Set(
-      traceRowsData // only spans in traces can define valid span ids
-        ?.filter(row => _.isString(row.SpanId) && row.SpanId.length > 0)
-        .map(row => row.SpanId) ?? [],
-    );
+    const ids = new Set<string>();
+    for (const row of traceRowsData) {
+      if (typeof row.SpanId === 'string' && row.SpanId.length > 0)
+        ids.add(row.SpanId);
+    }
+    return ids;
   }, [traceRowsData]);
 
   const traceExtent = useMemo(() => {
@@ -809,14 +801,14 @@ export function DBTraceWaterfallChartContainer({
       // stretch the envelope. Skip those before parsing.
       if (
         typeof row.Timestamp !== 'string' ||
-        Number.isNaN(Date.parse(row.Timestamp))
+        !getWaterfallTimestamp(row).isValidDate
       ) {
         continue;
       }
 
       let startMs: number;
       try {
-        startMs = parseTimestampToMs(row.Timestamp);
+        startMs = getWaterfallTimestamp(row).milliseconds;
       } catch {
         continue;
       }
@@ -851,18 +843,17 @@ export function DBTraceWaterfallChartContainer({
   // Map each distinct span service to a stable color. Sorting the names first
   // keeps a service's color stable across renders regardless of row ordering.
   const serviceColorMap = useMemo(() => {
-    const serviceNames = [
-      ...new Set(
-        rows
-          .filter(
-            r =>
-              r.ServiceName &&
-              r.type !== SourceKind.Log &&
-              typeof r.ServiceName === 'string',
-          )
-          .map(r => r.ServiceName),
-      ),
-    ].sort();
+    const names = new Set<string>();
+    for (const row of rows) {
+      if (
+        row.type !== SourceKind.Log &&
+        typeof row.ServiceName === 'string' &&
+        row.ServiceName
+      ) {
+        names.add(row.ServiceName);
+      }
+    }
+    const serviceNames = [...names].sort();
 
     const map = new Map<string, string>();
     serviceNames.forEach((name, i) => {
@@ -920,14 +911,21 @@ export function DBTraceWaterfallChartContainer({
   });
 
   const [collapsedIds, setCollapsedIds] = useState(() => new Set<string>());
-  const { rootNodes, nodesMap, parentIdsByLevel } = useMemo(
-    () => buildWaterfallTree(rows, validSpanIDs),
+  const prepareTree = useCallback(
+    () => createWaterfallTree(rows, validSpanIDs),
     [rows, validSpanIDs],
   );
-  const flattenedNodes = useMemo(
-    () => flattenWaterfallTree(rootNodes, collapsedIds),
+  const tree = useWaterfallTask(prepareTree, rows.length);
+  const { rootNodes, nodesMap, parentIdsByLevel } = tree.value ?? EMPTY_TREE;
+  const prepareVisible = useCallback(
+    () => createFlattenedWaterfallRows(rootNodes, collapsedIds),
     [rootNodes, collapsedIds],
   );
+  const flattened = useWaterfallTask(
+    prepareVisible,
+    tree.value ? rows.length : 0,
+  );
+  const flattenedNodes = flattened.value ?? EMPTY_TREE.rootNodes;
 
   const toggleCollapse = useCallback(
     (id: string, event: React.MouseEvent) => {
@@ -994,17 +992,16 @@ export function DBTraceWaterfallChartContainer({
   // TODO: Add backend filters for duration and collapsing?
 
   // All units in ms!
-  const minOffset = useMemo(() => {
-    let min = Number.MAX_SAFE_INTEGER;
-    for (const row of rows)
-      min = Math.min(min, parseTimestampToMs(row.Timestamp));
-    return min === Number.MAX_SAFE_INTEGER ? 0 : min;
-  }, [rows]);
-
-  const timelineRows = useMemo(
-    () => getWaterfallTimelineRows(visibleNodes, minOffset, serviceColorMap),
+  const minOffset = rows.length
+    ? getWaterfallTimestamp(rows[0]).milliseconds
+    : 0;
+  const prepareTimeline = useCallback(
+    () => createWaterfallTimelineRows(visibleNodes, minOffset, serviceColorMap),
     [visibleNodes, minOffset, serviceColorMap],
   );
+  const timeline = useWaterfallTask(prepareTimeline, visibleNodes.length);
+  const timelineRows = timeline.value ?? [];
+
   const renderRow = useCallback(
     (_row: unknown, index: number) =>
       renderWaterfallRow({
@@ -1033,7 +1030,10 @@ export function DBTraceWaterfallChartContainer({
     ],
   );
   const initialScrollRowIndex = useMemo(
-    () => visibleNodes.findIndex(v => v.id === highlightedRowWhere),
+    () =>
+      highlightedRowWhere == null
+        ? -1
+        : visibleNodes.findIndex(v => v.id === highlightedRowWhere),
     [visibleNodes, highlightedRowWhere],
   );
   const highlightedMinimapRow = useMemo(() => {
@@ -1055,6 +1055,12 @@ export function DBTraceWaterfallChartContainer({
   const [viewportController, setViewportController] =
     useState<TimelineViewportController | null>(null);
 
+  const isFetching =
+    isQueryFetching ||
+    sorted.isPreparing ||
+    tree.isPreparing ||
+    flattened.isPreparing ||
+    timeline.isPreparing;
   const showMinimap =
     !isFetching && !error && rows != null && visibleNodes.length > 0;
 

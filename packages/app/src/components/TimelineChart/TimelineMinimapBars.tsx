@@ -1,6 +1,12 @@
 import { memo, useEffect, useRef } from 'react';
 import { useComputedColorScheme } from '@mantine/core';
 
+import {
+  finishWaterfallTask,
+  runWaterfallTask,
+  WATERFALL_SYNC_ROW_LIMIT,
+} from '@/components/waterfallTask';
+
 import type { TTimelineEvent } from './TimelineChartRowEvents';
 
 const TICK_HEIGHT = 18;
@@ -41,8 +47,9 @@ export function TimelineMinimapHighlight({
         borderRadius: 1,
         left: `${(event.start / maxVal) * 100}%`,
         width: `${Math.max(((event.end - event.start) / maxVal) * 100, 0.15)}%`,
-        top: getMinimapRowTop(row.index, rowCount),
-        height: BAR_HEIGHT,
+        // Match the canvas bitmap scaling inside the bordered container.
+        top: `${(getMinimapRowTop(row.index, rowCount) / MINIMAP_HEIGHT) * 100}%`,
+        height: `${(BAR_HEIGHT / MINIMAP_HEIGHT) * 100}%`,
         backgroundColor: event.backgroundColor,
       }}
     />
@@ -66,6 +73,7 @@ export const TimelineMinimapBars = memo(function TimelineMinimapBars({
     const context = canvas.getContext('2d');
     if (!context) return;
 
+    let cancelDraw: (() => void) | undefined;
     let previousWidth: number | undefined;
     let previousPixelRatio: number | undefined;
     const draw = () => {
@@ -73,6 +81,10 @@ export const TimelineMinimapBars = memo(function TimelineMinimapBars({
       const height = MINIMAP_HEIGHT;
       const pixelRatio = window.devicePixelRatio || 1;
       if (width === previousWidth && pixelRatio === previousPixelRatio) return;
+      cancelDraw?.();
+      const controller = new AbortController();
+      cancelDraw = () => controller.abort();
+      canvas.dataset.rendering = 'false';
       previousWidth = width;
       previousPixelRatio = pixelRatio;
       canvas.width = Math.round(width * pixelRatio);
@@ -86,38 +98,62 @@ export const TimelineMinimapBars = memo(function TimelineMinimapBars({
       const colorProbe = document.createElement('span');
       colorProbe.style.display = 'none';
       container.appendChild(colorProbe);
-      const colors = new Map<string, string>();
-      let previousColor: string | undefined;
-      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-        const top = getMinimapRowTop(rowIndex, rows.length);
-        for (const event of rows[rowIndex].events) {
-          let color = colors.get(event.backgroundColor);
-          if (!color) {
-            colorProbe.style.color = event.backgroundColor;
-            color = getComputedStyle(colorProbe).color;
-            colors.set(event.backgroundColor, color);
+      canvas.dataset.rendering = 'true';
+      cancelDraw = () => {
+        controller.abort();
+        colorProbe.remove();
+      };
+      const paintContext = context;
+      const paintCanvas = canvas;
+      function* paint() {
+        const colors = new Map<string, string>();
+        let previousColor: string | undefined;
+        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+          const top = getMinimapRowTop(rowIndex, rows.length);
+          for (const event of rows[rowIndex].events) {
+            let color = colors.get(event.backgroundColor);
+            if (!color) {
+              colorProbe.style.color = event.backgroundColor;
+              color = getComputedStyle(colorProbe).color;
+              colors.set(event.backgroundColor, color);
+            }
+            if (color !== previousColor) {
+              paintContext.fillStyle = color;
+              previousColor = color;
+            }
+            paintContext.fillRect(
+              (event.start / maxVal) * width,
+              top,
+              Math.max(
+                ((event.end - event.start) / maxVal) * width,
+                width * 0.0015,
+              ),
+              BAR_HEIGHT,
+            );
           }
-          if (color !== previousColor) {
-            context.fillStyle = color;
-            previousColor = color;
-          }
-          context.fillRect(
-            (event.start / maxVal) * width,
-            top,
-            Math.max(
-              ((event.end - event.start) / maxVal) * width,
-              width * 0.0015,
-            ),
-            BAR_HEIGHT,
-          );
+          if ((rowIndex + 1) % 1000 === 0) yield;
         }
+
+        colorProbe.remove();
+        paintCanvas.dataset.rendering = 'false';
       }
-      colorProbe.remove();
+      if (rows.length <= WATERFALL_SYNC_ROW_LIMIT) finishWaterfallTask(paint());
+      else
+        void runWaterfallTask(paint(), controller.signal).catch(error => {
+          colorProbe.remove();
+          if (!controller.signal.aborted) {
+            canvas.dataset.rendering = 'false';
+            console.error('Could not draw waterfall minimap', error);
+          }
+        });
     };
     draw();
     const observer = new ResizeObserver(draw);
     observer.observe(container);
-    return () => observer.disconnect();
+    return () => {
+      cancelDraw?.();
+      observer.disconnect();
+    };
   }, [rows, maxVal, colorScheme]);
 
   return (

@@ -111,3 +111,6 @@ packages/*/reports/
 docs/superpowers/
 .superpowers/
 .playwright-mcp/
+
+# Generated local benchmark/validation output
+/artifacts/

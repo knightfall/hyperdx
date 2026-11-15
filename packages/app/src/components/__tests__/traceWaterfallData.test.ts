@@ -3,8 +3,10 @@ import { SourceKind } from '@hyperdx/common-utils/dist/types';
 
 import {
   buildWaterfallTree,
+  createSortedWaterfallRows,
   flattenWaterfallTree,
   getDescendantIds,
+  parseWaterfallTimestamp,
   sortWaterfallRows,
 } from '@/components/traceWaterfallData';
 import {
@@ -33,7 +35,7 @@ it('sorts timestamps once per row while preserving nanosecond order and ties', (
     { id: 'span', Timestamp: '2024-01-01T00:00:00.000000001Z' },
     { id: 'earlier', Timestamp: '2023-12-31T23:59:59.999999999Z' },
   ];
-  const parse = jest.spyOn(TimestampNano, 'fromString');
+  const parse = jest.spyOn(Date, 'parse');
   expect(sortWaterfallRows(rows).map(row => row.id)).toEqual([
     'earlier',
     'trigger',
@@ -121,4 +123,45 @@ it('keeps hidden descendants, late parents, duplicate spans and orphan logs', ()
     'child',
     'log',
   ]);
+});
+
+it('keeps exact nanosecond ordering when epoch milliseconds round to the next second', () => {
+  const rows = [
+    { Timestamp: '2024-01-01T00:00:01.000000000Z' },
+    { Timestamp: '2024-01-01T00:00:00.999999999Z' },
+    { Timestamp: '2024-01-01T00:00:00.999999998Z' },
+  ];
+  expect(sortWaterfallRows(rows)).toEqual([rows[2], rows[1], rows[0]]);
+});
+
+it.each([
+  '2024-01-01T00:00:00Z',
+  '2024-01-01T00:00:00.1Z',
+  '2024-01-01T00:00:00.123456789Z',
+  '2024-01-01T11:00:00.123456789+11:00',
+  '1969-12-31T23:59:59.999999999Z',
+])('preserves timestamp-nano precision for %s', value => {
+  const original = TimestampNano.fromString(value);
+  expect(parseWaterfallTimestamp(value)).toMatchObject({
+    seconds: original.getTimeT(),
+    nanos: original.getNano(),
+    milliseconds:
+      original.toDate().getTime() +
+      (original.getNano() % 1_000_000) / 1_000_000,
+  });
+});
+
+it('sorts shuffled chunks stably and yields before the full sort completes', () => {
+  const rows = Array.from({ length: 20_000 }, (_, index) => ({
+    id: index,
+    Timestamp: new Date(Date.UTC(2024, 0, 1) + (index % 101)).toISOString(),
+  })).reverse();
+  const task = createSortedWaterfallRows(rows);
+  expect(task.next().done).toBe(false);
+  let result = task.next();
+  while (!result.done) result = task.next();
+  const expected = [...rows].sort(
+    (a, b) => Date.parse(a.Timestamp) - Date.parse(b.Timestamp),
+  );
+  expect(result.value).toEqual(expected);
 });

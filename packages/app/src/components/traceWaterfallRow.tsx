@@ -21,7 +21,10 @@ import { getHttpUrl } from '@/utils/httpUrl';
 import { isRpcSpan } from '@/utils/rpcSpanAttributes';
 
 import type { DBTraceWaterfallChartContainer } from './DBTraceWaterfallChart';
-import type { WaterfallNode } from './traceWaterfallData';
+import {
+  getWaterfallTimestamp,
+  type WaterfallNode,
+} from './traceWaterfallData';
 import {
   barColor,
   getRowSeverity,
@@ -58,7 +61,7 @@ export function renderWaterfallRow({
   collapsedIds: Set<string>;
 }) {
   const tookMs = (result.Duration || 0) * 1000;
-  const startOffset = parseTimestampToMs(result.Timestamp);
+  const startOffset = getWaterfallTimestamp(result).milliseconds;
   const start = startOffset - minOffset;
   const end = start + tookMs;
 

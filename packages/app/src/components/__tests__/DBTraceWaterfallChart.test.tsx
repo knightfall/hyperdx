@@ -1654,6 +1654,43 @@ describe('useEventsAroundFocus', () => {
     expect((result.rows[1] as any).Body).toBe('after focus');
   });
 
+  it('reuses a completed window when the other window arrives with equivalent metadata', () => {
+    const getRowWhere = jest.fn((row: { Body: string }) => ({
+      where: row.Body,
+      aliasWith: [],
+    }));
+    mockUseRowWhere.mockReturnValue(getRowWhere);
+    let beforeData:
+      | { data: { Body: string }[]; meta: { name: string; type: string }[] }
+      | undefined = undefined;
+    const afterData = {
+      data: [{ Body: 'after' }],
+      meta: [{ name: 'Body', type: 'String' }],
+    };
+    mockUseOffsetPaginatedQuery.mockImplementation(query => ({
+      data: query.dateRangeStartInclusive ? beforeData : afterData,
+      isFetching: false,
+    }));
+    const { result, rerender } = renderHook(() =>
+      useEventsAroundFocus({
+        tableSource: mockTableSource,
+        focusDate: mockFocusDate,
+        dateRange: mockDateRange,
+        traceId: mockTraceId,
+        enabled: true,
+      }),
+    );
+    const completedRow = result.current.rows[0];
+    expect(getRowWhere).toHaveBeenCalledTimes(1);
+    beforeData = {
+      data: [{ Body: 'before' }],
+      meta: [{ name: 'Body', type: 'String' }],
+    };
+    rerender();
+    expect(getRowWhere).toHaveBeenCalledTimes(2);
+    expect(result.current.rows[1]).toBe(completedRow);
+  });
+
   it('handles empty data correctly', () => {
     const result = testEventsAroundFocus({});
     expect(result.rows.length).toBe(0);
