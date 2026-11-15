@@ -70,6 +70,17 @@ const stubs = {
   clickhouse: fs.readFileSync(path.join(__dirname, 'transport.js'), 'utf8'),
 };
 
+const browserTrace = process.argv.includes('--browser-trace');
+if (browserTrace) delete stubs['hooks/useBrowserTraceEvents'];
+const timingQuery = `const timing={data:[{span_id:'0000000000000000',timestamp:'2024-01-01T00:00:00.000000000Z',attributes:{'browser.resource_timing.fetch_start':'1000','browser.resource_timing.response_end':'1010'}}],meta:[{name:'timestamp',type:'DateTime64(9)'}]};
+export function useQueriedChartConfig(config,options){return {data:options.enabled&&options.queryKeyPrefix==='TraceResourceTiming'?timing:undefined,isLoading:false,isError:false};}`;
+
+if (browserTrace) {
+  stubs['hooks/useChartConfig'] = timingQuery;
+  stubs['hooks/useFieldExpressionGenerator'] =
+    'export default ()=>({isLoading:false,getFieldExpression:undefined});';
+}
+
 function instrument(source, filename, names) {
   const tree = ts.createSourceFile(
     filename,
@@ -118,6 +129,15 @@ async function build(before) {
             path: 'router',
             namespace: 'stub',
           }));
+          build.onResolve({ filter: /^@\/hooks\/useChartConfig$/ }, args => {
+            if (
+              browserTrace &&
+              args.importer
+                .replaceAll('\\', '/')
+                .endsWith('/hooks/useBrowserTraceEvents.ts')
+            )
+              return { path: 'timing-query', namespace: 'stub' };
+          });
           build.onResolve({ filter: /^@\// }, args => {
             const name = args.path.slice(2);
             if (Object.hasOwn(stubs, name))
@@ -148,11 +168,13 @@ async function build(before) {
           );
           build.onLoad({ filter: /.*/, namespace: 'stub' }, args =>
             stub(
-              args.path === 'sql-renderer'
-                ? `export const renderChartConfig=async(config)=>({sql:JSON.stringify(config),params:{}});`
-                : args.path === 'router'
-                  ? `const router={query:{},push:()=>{},replace:()=>{}};export const useRouter=()=>router;export default router;`
-                  : stubs[args.path],
+              args.path === 'timing-query'
+                ? timingQuery
+                : args.path === 'sql-renderer'
+                  ? `export const renderChartConfig=async(config)=>({sql:JSON.stringify(config),params:{}});`
+                  : args.path === 'router'
+                    ? `const router={query:{},push:()=>{},replace:()=>{}};export const useRouter=()=>router;export default router;`
+                    : stubs[args.path],
             ),
           );
           build.onLoad({ filter: /\.scss$/ }, args => ({
@@ -174,6 +196,11 @@ async function build(before) {
               'buildWaterfallTree',
               'flattenWaterfallTree',
               'getWaterfallTimelineRows',
+              'createSortedWaterfallRows',
+              'createWaterfallTree',
+              'createFlattenedWaterfallRows',
+              'createWaterfallTimelineRows',
+              'createWaterfallView',
             ]);
             return {
               contents,

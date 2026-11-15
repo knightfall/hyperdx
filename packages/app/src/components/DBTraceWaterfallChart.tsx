@@ -70,14 +70,13 @@ import { DBHighlightedAttributesList } from './DBHighlightedAttributesList';
 import { waterfallResultTransform } from './traceWaterfallAttributes';
 import {
   buildWaterfallTree,
-  createFlattenedWaterfallRows,
   createSortedWaterfallRows,
   createWaterfallTree,
   getDescendantIds,
   getWaterfallTimestamp,
 } from './traceWaterfallData';
 import {
-  createWaterfallTimelineRows,
+  createWaterfallView,
   getRowSeverity,
   getWaterfallTimelineRow,
   type WaterfallRow,
@@ -941,16 +940,35 @@ export function DBTraceWaterfallChartContainer({
     [rows, validSpanIDs],
   );
   const tree = useWaterfallTask(prepareTree, rows.length);
-  const { rootNodes, nodesMap, parentIdsByLevel } = tree.value ?? EMPTY_TREE;
-  const prepareVisible = useCallback(
-    () => createFlattenedWaterfallRows(rootNodes, collapsedIds),
-    [rootNodes, collapsedIds],
+  const minOffset = rows.length
+    ? getWaterfallTimestamp(rows[0]).milliseconds
+    : 0;
+  const viewScope = useMemo(
+    () => ({ fetchedTraceRows, fetchedLogRows, traceId, isQueryFetching }),
+    [fetchedTraceRows, fetchedLogRows, traceId, isQueryFetching],
   );
-  const flattened = useWaterfallTask(
-    prepareVisible,
-    tree.value ? rows.length : 0,
+  const prepareView = useCallback(
+    () =>
+      createWaterfallView(
+        tree.value ?? EMPTY_TREE,
+        collapsedIds,
+        minOffset,
+        serviceColorMap,
+        showSpans,
+        showLogs,
+      ),
+    [tree.value, collapsedIds, minOffset, serviceColorMap, showSpans, showLogs],
   );
-  const flattenedNodes = flattened.value ?? EMPTY_TREE.rootNodes;
+  const view = useWaterfallTask(prepareView, rows.length, {
+    enabled: !isQueryFetching && !sorted.isPreparing && !tree.isPreparing,
+    retainPreviousFor: viewScope,
+  });
+  const visibleNodes = view.value?.visibleNodes ?? EMPTY_TREE.rootNodes;
+  const timelineRows = view.value?.timelineRows ?? [];
+  const { nodesMap, parentIdsByLevel } = view.value?.tree ?? EMPTY_TREE;
+  const displayMinOffset = view.value?.minOffset ?? 0;
+  const displayServiceColorMap = view.value?.serviceColorMap ?? serviceColorMap;
+  const displayCollapsedIds = view.value?.collapsedIds ?? collapsedIds;
 
   const toggleCollapse = useCallback(
     (id: string, event: React.MouseEvent) => {
@@ -981,16 +999,6 @@ export function DBTraceWaterfallChartContainer({
 
   const hasCollapsibleNodes = parentIdsByLevel.size > 0;
 
-  const visibleNodes = useMemo(() => {
-    if (showSpans && showLogs) return flattenedNodes;
-    return flattenedNodes.filter(node => {
-      // The click belongs with the spans it started, not with the logs.
-      if (node.triggeredBy) return showSpans;
-      if (node.type === SourceKind.Log) return showLogs;
-      return showSpans;
-    });
-  }, [flattenedNodes, showSpans, showLogs]);
-
   const { spanCount, logCount, errorCount } = useMemo(() => {
     let spanCount = 0;
     let logCount = 0;
@@ -1016,42 +1024,31 @@ export function DBTraceWaterfallChartContainer({
   // TODO: Add duration filter?
   // TODO: Add backend filters for duration and collapsing?
 
-  // All units in ms!
-  const minOffset = rows.length
-    ? getWaterfallTimestamp(rows[0]).milliseconds
-    : 0;
-  const prepareTimeline = useCallback(
-    () => createWaterfallTimelineRows(visibleNodes, minOffset, serviceColorMap),
-    [visibleNodes, minOffset, serviceColorMap],
-  );
-  const timeline = useWaterfallTask(prepareTimeline, visibleNodes.length);
-  const timelineRows = timeline.value ?? [];
-
   const renderRow = useCallback(
     (_row: unknown, index: number) =>
       renderWaterfallRow({
         result: visibleNodes[index],
-        minOffset,
+        minOffset: displayMinOffset,
         formatTime,
         showSpanEvents,
         resourceTimingBySpanId,
         highlightedRowWhere,
-        serviceColorMap,
+        serviceColorMap: displayServiceColorMap,
         onClick,
         toggleCollapse,
-        collapsedIds,
+        collapsedIds: displayCollapsedIds,
       }),
     [
       visibleNodes,
-      minOffset,
+      displayMinOffset,
       formatTime,
       showSpanEvents,
       resourceTimingBySpanId,
       highlightedRowWhere,
-      serviceColorMap,
+      displayServiceColorMap,
       onClick,
       toggleCollapse,
-      collapsedIds,
+      displayCollapsedIds,
     ],
   );
   const initialScrollRowIndex = useMemo(
@@ -1066,13 +1063,18 @@ export function DBTraceWaterfallChartContainer({
     return {
       ...getWaterfallTimelineRow(
         visibleNodes[initialScrollRowIndex],
-        minOffset,
-        serviceColorMap,
+        displayMinOffset,
+        displayServiceColorMap,
         true,
       ),
       index: initialScrollRowIndex,
     };
-  }, [initialScrollRowIndex, visibleNodes, minOffset, serviceColorMap]);
+  }, [
+    initialScrollRowIndex,
+    visibleNodes,
+    displayMinOffset,
+    displayServiceColorMap,
+  ]);
 
   const { ref: timelineWrapperRef, height: timelineWrapperHeight } =
     useElementSize();
@@ -1080,12 +1082,7 @@ export function DBTraceWaterfallChartContainer({
   const [viewportController, setViewportController] =
     useState<TimelineViewportController | null>(null);
 
-  const isFetching =
-    isQueryFetching ||
-    sorted.isPreparing ||
-    tree.isPreparing ||
-    flattened.isPreparing ||
-    timeline.isPreparing;
+  const isFetching = isQueryFetching || view.value == null;
   const showMinimap =
     !isFetching && !error && rows != null && visibleNodes.length > 0;
 
@@ -1323,6 +1320,8 @@ export function DBTraceWaterfallChartContainer({
       )}
       <div
         ref={timelineWrapperRef}
+        data-testid="trace-waterfall-viewport"
+        aria-busy={view.isPreparing}
         style={{
           position: 'relative',
           overflow: 'hidden',
@@ -1350,7 +1349,7 @@ export function DBTraceWaterfallChartContainer({
             An unknown error occurred. <ContactSupportText />
           </div>
         ) : visibleNodes.length === 0 ? (
-          flattenedNodes.length > 0 ? (
+          (view.value?.flattenedCount ?? 0) > 0 ? (
             <div className="my-3">All items are hidden by filters</div>
           ) : (
             (emptyState ?? (

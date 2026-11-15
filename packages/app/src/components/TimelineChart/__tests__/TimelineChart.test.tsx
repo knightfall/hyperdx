@@ -1,4 +1,4 @@
-import { fireEvent, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 
 import { TimelineChart } from '@/components/TimelineChart/TimelineChart';
 import type { TTimelineEvent } from '@/components/TimelineChart/TimelineChartRowEvents';
@@ -72,5 +72,31 @@ describe('TimelineChart', () => {
     // Lives in the corner cell above the span labels rather than in a row of
     // its own above the chart.
     expect(hint.closest('[data-testid="timeline-corner"]')).toBeInTheDocument();
+  });
+  it('keeps its controller and clicks the current rows after replacement', () => {
+    const onReady = jest.fn();
+    const onEventClick = jest.fn();
+    const rows = [makeRow('root', 0, 100), makeRow('child', 10, 40)];
+    const next = [makeRow('root', 0, 120), makeRow('child', 20, 60)];
+    const chart = (items: typeof rows) => (
+      <TimelineChart
+        initialScrollRowIndex={-1}
+        labelWidth={300}
+        maxHeight={400}
+        rowHeight={22}
+        rows={items}
+        onEventClick={onEventClick}
+        onReady={onReady}
+      />
+    );
+    const { rerender } = render(chart(rows), { wrapper: TestProviders });
+    const element = screen.getAllByText('child')[0];
+    const controller = onReady.mock.calls[0][0];
+    rerender(chart(next));
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(onReady.mock.calls[0][0]).toBe(controller);
+    expect(screen.getAllByText('child')[0]).toBe(element);
+    fireEvent.click(element);
+    expect(onEventClick).toHaveBeenCalledWith(next[1]);
   });
 });

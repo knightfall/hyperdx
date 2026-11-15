@@ -1,95 +1,107 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  median,
+  groupResults,
+  comparableEnvironment,
+  errorSummary,
+} = require('./results.cjs');
 const repo = process.env.WATERFALL_REPO || path.resolve(__dirname, '../../..');
 const root =
   process.env.WATERFALL_ARTIFACTS ||
   path.join(repo, 'artifacts/trace-waterfall');
-const before = JSON.parse(
-  fs.readFileSync(path.join(root, 'memory-before/memory-results.json')),
-);
-const after = JSON.parse(
-  fs.readFileSync(path.join(root, 'memory-after/memory-results.json')),
-);
-const median = values =>
-  [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
-const rows = [];
-for (const { scenario } of before.results.filter(r => r.repetition === 1)) {
-  const select = data =>
-    data.results.filter(
-      r =>
-        r.scenario.spans === scenario.spans &&
-        r.scenario.logs === scenario.logs,
-    );
-  const summarize = data => ({
-    retainedMiB: median(data.map(r => r.memory.loaded.retainedMiB)),
-    peakMiB: median(data.map(r => r.memory.peakMiB)),
-    afterUnmountMiB: median(data.map(r => r.memory.unmounted.retainedMiB)),
-    loadMs: median(data.map(r => r.initialLoadMs)),
-    longestTaskMs: median(data.map(r => r.longestTaskMs)),
-  });
-  const baseline = summarize(select(before));
-  const optimized = summarize(select(after));
+const read = filename =>
+  fs.existsSync(filename)
+    ? JSON.parse(fs.readFileSync(filename, 'utf8'))
+    : undefined;
+const before = read(path.join(root, 'memory-before/memory-results.json'));
+const after =
+  read(path.join(root, 'memory-after/memory-results.json')) ||
+  read(path.join(root, 'memory-results.json'));
+if (!after?.results?.length)
+  throw Error(
+    'No memory measurements. Run run.cjs --memory --benchmark-only first.',
+  );
+const baselineGroups = groupResults(before),
+  currentGroups = groupResults(after);
+const environmentMatches = comparableEnvironment(before, after);
+const summarize = runs => ({
+  retainedMiB: median(runs.map(r => r.memory?.loaded?.retainedMiB)),
+  peakMiB: median(runs.map(r => r.memory?.peakMiB)),
+  afterUnmountMiB: median(runs.map(r => r.memory?.unmounted?.retainedMiB)),
+  loadMs: median(runs.map(r => r.initialLoadMs)),
+  longestTaskMs: median(runs.map(r => r.longestTaskMs)),
+});
+const format = n => (Number.isFinite(n) ? n.toFixed(2) : 'not recorded');
+const rows = [],
+  table = [],
+  timing = [];
+for (const [key, runs] of currentGroups) {
+  const previous = environmentMatches ? baselineGroups.get(key) : undefined;
+  const baseline = previous?.length ? summarize(previous) : undefined;
+  const optimized = summarize(runs);
+  const scenario = runs[0].scenario;
+  const change =
+    baseline?.retainedMiB > 0 && Number.isFinite(optimized.retainedMiB)
+      ? (1 - optimized.retainedMiB / baseline.retainedMiB) * 100
+      : undefined;
   rows.push({
     scenario,
     baseline,
     optimized,
-    retainedReductionPercent:
-      (1 - optimized.retainedMiB / baseline.retainedMiB) * 100,
+    baselineRuns: previous?.length ?? 0,
+    currentRuns: runs.length,
+    retainedReductionPercent: change,
   });
+  const label = `${scenario.spans} spans + ${scenario.logs} logs`;
+  const pair = field =>
+    (baseline ? format(baseline[field]) + ' → ' : '') +
+    format(optimized[field]);
+  table.push(
+    `| ${label} | ${previous?.length ?? '—'} / ${runs.length} | ${pair('retainedMiB')} MiB | ${pair('afterUnmountMiB')} MiB |`,
+  );
+  timing.push(
+    `| ${label} | ${pair('peakMiB')} MiB | ${pair('loadMs')}ms | ${pair('longestTaskMs')}ms |`,
+  );
 }
+const lines = [
+  '# Waterfall memory comparison',
+  '',
+  `Report generated: ${new Date().toISOString()}.`,
+  `Measurements recorded: ${after.environment?.recordedAt ?? 'not recorded'}.`,
+  `Benchmark revision: ${after.environment?.commit ?? 'not recorded'}.`,
+  '',
+  before
+    ? 'Medians use matching fixture settings and recorded browser/CPU/mode values.'
+    : 'No baseline supplied; current memory measurements only.',
+  '',
+  '| Fixture | Runs: baseline / current | Retained after load | After closing chart |',
+  '| --- | ---: | ---: | ---: |',
+  ...table,
+  '',
+  '| Fixture | Sampled peak | Initial load | Longest load task |',
+  '| --- | ---: | ---: | ---: |',
+  ...timing,
+  '',
+  `Runs: ${after.results.length}.`,
+  errorSummary(after.results),
+  '',
+  '## Method and limits',
+  '',
+  'Retained values come from HeapProfiler.collectGarbage followed by Runtime.getHeapUsage. The sampled peak polls usedJSHeapSize every 20ms and can miss transient peaks during long tasks. These are JavaScript heap measurements, not process RSS or GPU memory.',
+  '',
+  'The first repetition records sampled live allocations. Initial-load timing in that repetition includes profiler overhead. If interaction flags were also supplied, the retained sample and peak include those interactions. Compare equivalent scenarios and run modes.',
+  '',
+  `Browser: ${after.environment?.browser ?? 'not recorded'}; CPU: ${after.environment?.cpu?.trim() ?? 'not recorded'}; mode: ${after.environment?.mode ?? 'not recorded'}.`,
+  `Browser trace hook: ${after.environment?.browserTraceHook ?? 'coverage not recorded'}.`,
+  '',
+  'The report summarizes supplied measurements. External tests and lint checks require their own logs. Inspect the saved allocation profiles to investigate retaining paths.',
+  '',
+  `[Benchmark instructions](${path.join(repo, 'scripts/benchmarks/trace-waterfall/README.md').replaceAll('\\', '/')})`,
+];
+fs.writeFileSync(path.join(root, 'MEMORY.md'), lines.join('\n') + '\n');
 fs.writeFileSync(
   path.join(root, 'memory-comparison.json'),
   JSON.stringify(rows, null, 2),
 );
-const f = n => Math.round(n).toLocaleString('en-US');
-const title = r =>
-  `${f(r.scenario.spans)} spans${r.scenario.logs ? ' + ' + f(r.scenario.logs) + ' logs' : ''}`;
-const table = rows
-  .map(
-    r =>
-      `| ${title(r)} | ${f(r.baseline.retainedMiB)} → ${f(r.optimized.retainedMiB)} MiB | ${r.retainedReductionPercent.toFixed(1)}% | ${f(r.baseline.afterUnmountMiB)} → ${f(r.optimized.afterUnmountMiB)} MiB |`,
-  )
-  .join('\n');
-const peakTable = rows
-  .map(
-    r =>
-      `| ${title(r)} | ${f(r.baseline.peakMiB)} → ${f(r.optimized.peakMiB)} MiB | ${(r.baseline.loadMs / 1000).toFixed(2)} → ${(r.optimized.loadMs / 1000).toFixed(2)}s | ${f(r.baseline.longestTaskMs)} → ${f(r.optimized.longestTaskMs)}ms |`,
-  )
-  .join('\n');
-const body = `# Waterfall memory optimization
-
-Garbage-collected JavaScript heap, medians of three fresh browser contexts per scenario.
-
-| Fixture | Retained after load | Reduction | After closing chart |
-| --- | --- | --- | --- |
-${table}
-
-| Fixture | Sampled load peak | Initial load | Longest load task |
-| --- | --- | --- | --- |
-${peakTable}
-
-## What changed
-
-- Filter unrelated SpanAttributes during decoding, before the query cache retains them. Keep HTTP/RPC label namespaces, browser/session context, complete SpanEvents (including attributes), highlighted columns, and all row-identity fields. Explicitly highlighted whole attribute maps keep their complete representation.
-- Isolate transformed results with a versioned cache key. Existing consumers retain their original result format and cache lifetime.
-- Waterfall query windows use gcTime=0: the last observer leaving releases the query. Simultaneous observers still share their active result; reopening a closed trace fetches again.
-- Decode chunks in a loop so completed read frames can be released during loading.
-
-## Findings and remaining costs
-
-The baseline kept roughly 229 MiB (200,000 spans) or 518 MiB (largest fixture) in its five-minute cache after unmount. Explicitly clearing that cache returned both to about 9 MiB. The optimized chart reaches that level automatically after unmount.
-
-Live-allocation samples identify decoded payloads, SQL predicate strings used as row IDs, prepared/tree rows, timeline events, and virtualizer measurements as the main retained allocations. Larger further reductions would require compact internal row keys and/or loading full span events on demand. These require separate selection, filtering, scrolling, and marker validation. Large attributes in the retained HTTP/RPC namespaces and large event arrays still cost memory.
-
-Filtering is client-side: SQL payload volume is unchanged. This preserves source-schema compatibility but still pays network and JSON parsing costs for the original attributes.
-
-## Verification and limits
-
-Environment: ${after.environment.browser}, ${after.environment.cpu}, ${after.environment.logicalCpus} logical CPUs, ${after.environment.memoryGiB.toFixed(1)} GiB RAM. Production React, no CPU/network throttling, 1440×900. Same synthetic fixture as the existing load benchmark: six attributes including a unique 512-character payload, two span events per trace, and optional correlated logs. Full server query execution, production network/compression, authentication, and app startup are excluded.
-
-Loaded/unmounted measurements use HeapProfiler.collectGarbage then Runtime.getHeapUsage. The sampled load peak polls usedJSHeapSize every 20ms and can miss transient peaks during long tasks. These are JS-heap measurements, not process RSS, GPU memory, or network-buffer measurements. Allocation profiles sample live objects at 64 KiB intervals in the first repetition. Initial-load timing from that repetition includes profiler overhead; these timings should not be treated as production estimates.
-
-The raw results, heap profiles, source maps, screenshots and source-mapped allocation summaries live under memory-before/ and memory-after/. Run the memory mode and report command documented in scripts/benchmarks/trace-waterfall/README.md to reproduce.
-`;
-fs.writeFileSync(path.join(root, 'MEMORY.md'), body);
-console.log(JSON.stringify(rows, null, 2));
+console.log(table.join('\n'));

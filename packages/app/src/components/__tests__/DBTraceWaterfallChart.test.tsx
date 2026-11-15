@@ -60,6 +60,8 @@ jest.mock('@/components/TimelineChart', () => {
   };
 
   const mockComponent = function MockTimelineChart(props: any) {
+    const [instance] = React.useState(() => Symbol());
+    mockComponent.latestInstance = instance;
     const renderedProps = {
       ...props,
       rows: props.rows.map(
@@ -79,6 +81,7 @@ jest.mock('@/components/TimelineChart', () => {
     );
   };
   mockComponent.latestProps = {};
+  mockComponent.latestInstance = Symbol();
 
   const MockTimelineMinimap = function MockTimelineMinimap(props: any) {
     MockTimelineMinimap.latestProps = props;
@@ -330,6 +333,58 @@ describe('DBTraceWaterfallChartContainer', () => {
   };
 
   // Test cases
+  it('keeps the same chart mounted while preparing large collapsed and filtered views', async () => {
+    const limit = jest.replaceProperty(
+      jest.requireMock('@/components/traceWaterfallLimits'),
+      'TRACE_WATERFALL_ROW_LIMIT',
+      2000,
+    );
+    const fetchLimit = jest.replaceProperty(
+      jest.requireMock('@/components/traceWaterfallLimits'),
+      'TRACE_WATERFALL_FETCH_LIMIT',
+      2001,
+    );
+    try {
+      const rows = Array.from({ length: 1002 }, (_, i) => ({
+        ...mockTraceData.data[0],
+        SpanId: 'span-' + i,
+        ParentSpanId: i % 10 === 0 ? '' : 'span-' + Math.floor(i / 10) * 10,
+      }));
+      mockUseRowWhere.mockReturnValue((row: SpanRow) => ({
+        where: 'span:' + row.SpanId,
+        aliasWith: [],
+      }));
+      setupQueryMocks({
+        traceData: { ...mockTraceData, data: rows },
+        logData: emptyData,
+      });
+      renderComponent();
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(1002),
+      );
+      const instance = MockTimelineChart.latestInstance;
+      await userEvent.click(screen.getByLabelText('Collapse all'));
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(101),
+      );
+      expect(MockTimelineChart.latestInstance).toBe(instance);
+      await userEvent.click(screen.getByLabelText('Expand all'));
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(1002),
+      );
+      expect(MockTimelineChart.latestInstance).toBe(instance);
+      await userEvent.click(screen.getByTestId('show-logs-chip'));
+      await waitFor(() =>
+        expect(MockTimelineChart.latestProps.rows).toHaveLength(1002),
+      );
+      expect(MockTimelineChart.latestInstance).toBe(instance);
+      expect(screen.queryByText('Loading Traces...')).not.toBeInTheDocument();
+    } finally {
+      limit.restore();
+      fetchLimit.restore();
+    }
+  });
+
   it('renders loading state when data is being fetched', () => {
     mockUseOffsetPaginatedQuery.mockReturnValue({
       data: undefined,
@@ -1291,11 +1346,11 @@ describe('DBTraceWaterfallChartContainer', () => {
     });
 
     it('renders the log rows the hook keeps', async () => {
-      mockUseBrowserTraceEvents.mockImplementation(() => ({
+      mockUseBrowserTraceEvents.mockReturnValue({
         logRows: [],
         resourceTimingBySpanId: new Map(),
         triggerRow: undefined,
-      }));
+      });
       setupQueryMocks({ traceData: mockTraceData, logData: mockLogData });
       renderComponent();
       await waitForLoading();

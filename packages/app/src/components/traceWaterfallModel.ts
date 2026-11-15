@@ -11,6 +11,8 @@ import {
 
 import type { SpanRow } from './DBTraceWaterfallChart';
 import {
+  buildWaterfallTree,
+  createFlattenedWaterfallRows,
   createWaterfallRows,
   getWaterfallTimestamp,
   type WaterfallNode,
@@ -80,7 +82,7 @@ export function getWaterfallTimelineRows(
   );
 }
 
-export function* createWaterfallTimelineRows(
+function* createWaterfallTimelineRows(
   visibleNodes: WaterfallNode<WaterfallRow>[],
   minOffset: number,
   serviceColorMap: Map<string, string>,
@@ -147,5 +149,50 @@ export function getWaterfallTimelineRow(
         minWidthPx: result.type === SourceKind.Log ? 10 : 2,
       },
     ],
+  };
+}
+
+// Publish matching row identities, positions, and tree controls as one result.
+export function* createWaterfallView(
+  tree: ReturnType<typeof buildWaterfallTree<WaterfallRow>>,
+  collapsedIds: Set<string>,
+  minOffset: number,
+  serviceColorMap: Map<string, string>,
+  showSpans: boolean,
+  showLogs: boolean,
+) {
+  const flattened = yield* createFlattenedWaterfallRows(
+    tree.rootNodes,
+    collapsedIds,
+  );
+  let visibleNodes = flattened;
+  if (!showSpans || !showLogs) {
+    visibleNodes = [];
+    for (let i = 0; i < flattened.length; i++) {
+      const node = flattened[i];
+      if (
+        node.triggeredBy
+          ? showSpans
+          : node.type === SourceKind.Log
+            ? showLogs
+            : showSpans
+      )
+        visibleNodes.push(node);
+      if ((i + 1) % 1000 === 0) yield;
+    }
+  }
+  const timelineRows = yield* createWaterfallTimelineRows(
+    visibleNodes,
+    minOffset,
+    serviceColorMap,
+  );
+  return {
+    tree,
+    collapsedIds,
+    minOffset,
+    serviceColorMap,
+    visibleNodes,
+    timelineRows,
+    flattenedCount: flattened.length,
   };
 }

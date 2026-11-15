@@ -118,27 +118,46 @@ export function useBrowserTraceEvents<T extends LogRow>({
   // The selected row and the row the panel opened from stay: folding them
   // would leave the detail panel showing a row the waterfall lacks, and the
   // hint would find nothing to select.
+  const hintTimestamp = initialRowHighlightHint?.timestamp;
+  const hintSpanId = initialRowHighlightHint?.spanId;
+  const hintBody = initialRowHighlightHint?.body;
+  const foldingHint = useMemo(
+    () =>
+      hintTimestamp !== undefined &&
+      hintSpanId !== undefined &&
+      hintBody !== undefined
+        ? { timestamp: hintTimestamp, spanId: hintSpanId, body: hintBody }
+        : undefined,
+    [hintTimestamp, hintSpanId, hintBody],
+  );
+  const folding = useMemo(() => {
+    if (!foldTimingRows || drawnRowCounts.size === 0) return undefined;
+    const keys = getFoldedRowKeys(logRows, drawnRowCounts);
+    if (keys.size === 0) return undefined;
+    const ids = new Set<string>();
+    for (const row of logRows) {
+      if (
+        keys.has(resourceTimingRowKey(row.SpanId, row.Timestamp)) &&
+        !matchesRowHighlightHint(row, foldingHint)
+      )
+        ids.add(row.id);
+    }
+    return { keys, ids };
+  }, [logRows, foldTimingRows, drawnRowCounts, foldingHint]);
+  // Selecting a span or an already visible log cannot change folding membership.
+  const keptSelectedId =
+    highlightedRowWhere != null && folding?.ids.has(highlightedRowWhere)
+      ? highlightedRowWhere
+      : undefined;
   const keptLogRows = useMemo(() => {
-    if (!foldTimingRows || drawnRowCounts.size === 0) {
-      return logRows;
-    }
-    const foldedRowKeys = getFoldedRowKeys(logRows, drawnRowCounts);
-    if (foldedRowKeys.size === 0) {
-      return logRows;
-    }
+    if (!folding) return logRows;
     return logRows.filter(
       row =>
-        !foldedRowKeys.has(resourceTimingRowKey(row.SpanId, row.Timestamp)) ||
-        row.id === highlightedRowWhere ||
-        matchesRowHighlightHint(row, initialRowHighlightHint),
+        !folding.keys.has(resourceTimingRowKey(row.SpanId, row.Timestamp)) ||
+        row.id === keptSelectedId ||
+        matchesRowHighlightHint(row, foldingHint),
     );
-  }, [
-    logRows,
-    foldTimingRows,
-    drawnRowCounts,
-    highlightedRowWhere,
-    initialRowHighlightHint,
-  ]);
+  }, [logRows, folding, keptSelectedId, foldingHint]);
 
   // Only the trigger query reads a single attribute, so only it needs the
   // JSON column lookup.

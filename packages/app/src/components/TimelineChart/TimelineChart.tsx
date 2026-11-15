@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 import cx from 'classnames';
 import { Flex, Text } from '@mantine/core';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -18,6 +18,11 @@ import {
   TimelineChartRowEvents,
   type TTimelineEvent,
 } from './TimelineChartRowEvents';
+import {
+  subscribeToViewport,
+  useTimelineHeight,
+  useTimelineViewportEffects,
+} from './useTimelineViewportEffects';
 import { getMaxEventValue } from './utils';
 
 import styles from './TimelineChart.module.scss';
@@ -130,25 +135,12 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
   const xAxisHandleRef = useRef<TimelineXAxisHandle>(null);
   const mouseCursorHandleRef = useRef<TimelineMouseCursorHandle>(null);
 
-  useLayoutEffect(() => {
-    const element = timelineRef.current;
-    if (element == null) return;
-
-    timelineHeightRef.current = element.getBoundingClientRect().height;
-    xAxisHandleRef.current?.recompute();
-    mouseCursorHandleRef.current?.recompute();
-
-    const observer = new ResizeObserver(entries => {
-      const entry = entries[0];
-      if (entry == null) return;
-      timelineHeightRef.current = entry.contentRect.height;
-      xAxisHandleRef.current?.recompute();
-      mouseCursorHandleRef.current?.recompute();
-    });
-    observer.observe(element);
-
-    return () => observer.disconnect();
-  }, []);
+  useTimelineHeight(
+    timelineRef,
+    timelineHeightRef,
+    xAxisHandleRef,
+    mouseCursorHandleRef,
+  );
 
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
@@ -248,12 +240,9 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
     commitViewport(1, 0);
   });
 
-  const subscribeViewport = useStableCallback((cb: () => void) => {
-    subscribersRef.current.add(cb);
-    return () => {
-      subscribersRef.current.delete(cb);
-    };
-  });
+  const subscribeViewport = useStableCallback((cb: () => void) =>
+    subscribeToViewport(subscribersRef.current, cb),
+  );
 
   // Stable controller object created once; methods are stable (useStableCallback).
   const controllerRef = useRef<TimelineViewportController | null>(null);
@@ -273,16 +262,6 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
     }
   }, [onReady]);
 
-  // Native horizontal scroll (trackpad / scrollbar) pans the events area; keep
-  // the minimap viewport rectangle in sync.
-  useEffect(() => {
-    const element = timelineRef.current;
-    if (element == null) return;
-    const onScroll = () => notifyViewport();
-    element.addEventListener('scroll', onScroll, { passive: true });
-    return () => element.removeEventListener('scroll', onScroll);
-  }, [notifyViewport]);
-
   // Re-notify subscribers when the label column is resized, because the
   // events-area width fraction changes even though scale and scrollLeft don't.
   // Without this the minimap viewport rect keeps stale offset/width fractions
@@ -290,15 +269,6 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
   useEffect(() => {
     notifyViewport();
   }, [labelWidth, notifyViewport]);
-
-  useEffect(() => {
-    return () => {
-      if (notifyRafRef.current != null) {
-        cancelAnimationFrame(notifyRafRef.current);
-        notifyRafRef.current = null;
-      }
-    };
-  }, []);
 
   // Wheel deltas accumulate into a pending state and the zoom commit runs
   // once per frame via rAF, so a fast scroll in one frame collapses to a
@@ -375,29 +345,13 @@ export const TimelineChart = memo(function (props: TimelineChartProps) {
     state.rafId = requestAnimationFrame(flushWheel);
   });
 
-  useEffect(() => {
-    const element = timelineRef.current;
-
-    if (element != null) {
-      // `passive: false` because we call e.preventDefault() to suppress
-      // page scroll when zooming with cmd/ctrl + wheel.
-      element.addEventListener('wheel', onWheel, { passive: false });
-
-      return () => {
-        element.removeEventListener('wheel', onWheel);
-      };
-    }
-  }, [onWheel]);
-
-  useEffect(() => {
-    const state = wheelStateRef.current;
-    return () => {
-      if (state.rafId != null) {
-        cancelAnimationFrame(state.rafId);
-        state.rafId = null;
-      }
-    };
-  }, []);
+  useTimelineViewportEffects(
+    timelineRef,
+    notifyViewport,
+    notifyRafRef,
+    onWheel,
+    wheelStateRef,
+  );
 
   const handleRowClick = useStableCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {

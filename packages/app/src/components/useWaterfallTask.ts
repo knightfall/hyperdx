@@ -6,47 +6,83 @@ import {
   WATERFALL_SYNC_ROW_LIMIT,
 } from './waterfallTask';
 
-// Task factories are memoized by the caller so selection/resize renders do not
-// restart preparation. A changed trace never publishes the previous job's rows.
+// Callers memoize task factories. Retention is opt-in and scoped to one query.
+// Obsolete results are released during query changes and navigation.
 export default function useWaterfallTask<T>(
   createTask: () => Generator<void, T>,
   rowCount: number,
+  {
+    enabled = true,
+    retainPreviousFor,
+  }: { enabled?: boolean; retainPreviousFor?: object } = {},
 ) {
   const immediate = useMemo(
     () =>
-      rowCount <= WATERFALL_SYNC_ROW_LIMIT
+      enabled && rowCount <= WATERFALL_SYNC_ROW_LIMIT
         ? { value: finishWaterfallTask(createTask()) }
         : undefined,
-    [createTask, rowCount],
+    [createTask, rowCount, enabled],
   );
   const [completed, setCompleted] = useState<
-    | { task: typeof createTask; value: T; error?: never }
-    | { task: typeof createTask; error: unknown; value?: never }
+    | {
+        task: typeof createTask;
+        scope: typeof retainPreviousFor;
+        value: T;
+        error?: never;
+      }
+    | {
+        task: typeof createTask;
+        scope: typeof retainPreviousFor;
+        error: unknown;
+        value?: never;
+      }
   >();
 
   useEffect(() => {
-    if (immediate) return;
+    if (!enabled || immediate) return;
     const controller = new AbortController();
     void runWaterfallTask(createTask(), controller.signal).then(
       value => {
         if (!controller.signal.aborted)
-          setCompleted({ task: createTask, value });
+          setCompleted({ task: createTask, scope: retainPreviousFor, value });
       },
       error => {
         if (!controller.signal.aborted)
-          setCompleted({ task: createTask, error });
+          setCompleted({ task: createTask, scope: retainPreviousFor, error });
       },
     );
     return () => controller.abort();
-  }, [createTask, immediate]);
+  }, [createTask, immediate, enabled, retainPreviousFor]);
 
-  // Release completed arrays immediately when navigating to another trace.
-  if (completed && completed.task !== createTask) setCompleted(undefined);
+  if (immediate && retainPreviousFor) {
+    if (completed?.task !== createTask || completed.scope !== retainPreviousFor)
+      setCompleted({
+        task: createTask,
+        scope: retainPreviousFor,
+        value: immediate.value,
+      });
+  } else if (
+    completed &&
+    (completed.scope !== retainPreviousFor ||
+      (!retainPreviousFor && completed.task !== createTask))
+  ) {
+    setCompleted(undefined);
+  }
 
   if (immediate) return { value: immediate.value, isPreparing: false };
-  if (completed?.task === createTask) {
+  if (
+    enabled &&
+    completed?.task === createTask &&
+    completed.scope === retainPreviousFor
+  ) {
     if ('error' in completed) throw completed.error;
     return { value: completed.value, isPreparing: false };
   }
+  if (
+    retainPreviousFor &&
+    completed?.scope === retainPreviousFor &&
+    'value' in completed
+  )
+    return { value: completed.value, isPreparing: true };
   return { value: undefined, isPreparing: true };
 }

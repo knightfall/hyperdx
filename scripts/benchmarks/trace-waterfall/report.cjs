@@ -1,169 +1,158 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const {
+  median,
+  groupResults,
+  comparableEnvironment,
+  errorSummary,
+} = require('./results.cjs');
 const repo = process.env.WATERFALL_REPO || path.resolve(__dirname, '../../..');
 const root =
   process.env.WATERFALL_ARTIFACTS ||
   path.join(repo, 'artifacts/trace-waterfall');
-const read = name => JSON.parse(fs.readFileSync(path.join(root, name), 'utf8'));
-const before = read('performance-results.json');
+const read = name => {
+  const filename = path.join(root, name);
+  return fs.existsSync(filename)
+    ? JSON.parse(fs.readFileSync(filename, 'utf8'))
+    : undefined;
+};
 const after = read('performance-optimized.json');
-const alignments = read('alignment-results.json');
-const median = values =>
-  [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
-const group = data =>
-  Map.groupBy(
-    data.results,
-    run => run.scenario.spans + '/' + run.scenario.logs,
+if (!after?.results?.length)
+  throw new Error(
+    'No optimized measurements. Run build.cjs and run.cjs --optimized first.',
   );
-const oldGroups = group(before),
-  newGroups = group(after);
+const before = read('performance-results.json');
+const oldGroups = groupResults(before),
+  newGroups = groupResults(after);
 const summarize = runs => ({
   load: median(runs.map(r => r.initialLoadMs)),
   task: median(runs.map(r => r.longestTaskMs)),
   heap: median(runs.map(r => r.usedHeapMiB)),
 });
-const tables = [],
-  comparisons = [];
-for (const [key, runs] of newGroups) {
-  const old = summarize(oldGroups.get(key)),
-    current = summarize(runs);
-  const [spans, logs] = key.split('/').map(Number);
-  comparisons.push({
-    spans,
-    logs,
-    before: old,
-    after: current,
-    loadReductionPercent: (1 - current.load / old.load) * 100,
-    longestTaskReductionPercent: (1 - current.task / old.task) * 100,
-  });
+const comparable = comparableEnvironment(before, after);
+const comparisons = [],
+  tables = [],
+  outcomes = [];
+const number = n => (Number.isFinite(n) ? n.toFixed(2) : 'not recorded');
+const seconds = n =>
+  Number.isFinite(n) ? (n / 1000).toFixed(3) + 's' : 'not recorded';
+for (const [fixture, runs] of newGroups) {
+  const current = summarize(runs);
+  const baselineRuns = comparable ? oldGroups.get(fixture) : undefined;
+  const old = baselineRuns?.length ? summarize(baselineRuns) : undefined;
+  const { spans, logs, ...settings } = runs[0].scenario;
+  const label = `${Number(spans).toLocaleString('en-US')} spans + ${Number(logs).toLocaleString('en-US')} logs (${JSON.stringify(settings)})`;
+  if (old && Number.isFinite(old.load) && Number.isFinite(current.load)) {
+    const loadReductionPercent =
+      old.load > 0 ? (1 - current.load / old.load) * 100 : undefined;
+    const longestTaskReductionPercent =
+      old.task > 0 ? (1 - current.task / old.task) * 100 : undefined;
+    comparisons.push({
+      spans,
+      logs,
+      scenario: runs[0].scenario,
+      before: old,
+      after: current,
+      loadReductionPercent,
+      longestTaskReductionPercent,
+    });
+    const change =
+      loadReductionPercent > 0
+        ? `decreased by ${loadReductionPercent.toFixed(1)}%`
+        : loadReductionPercent < 0
+          ? `increased by ${(-loadReductionPercent).toFixed(1)}%`
+          : old.load === current.load
+            ? 'was unchanged'
+            : `changed from ${seconds(old.load)} to ${seconds(current.load)} (percentage unavailable)`;
+    outcomes.push(`- ${label}: median load ${change}.`);
+  } else
+    outcomes.push(
+      `- ${label}: No comparable baseline; current measurements only.`,
+    );
   tables.push(
-    '| ' +
-      [
-        spans.toLocaleString('en-US'),
-        logs.toLocaleString('en-US'),
-        (old.load / 1000).toFixed(2) +
-          's → ' +
-          (current.load / 1000).toFixed(2) +
-          's',
-        (old.task / 1000).toFixed(2) +
-          's → ' +
-          (current.task / 1000).toFixed(3) +
-          's',
-        (old.heap / 1024).toFixed(2) +
-          ' → ' +
-          (current.heap / 1024).toFixed(2) +
-          ' GiB',
-      ].join(' | ') +
-      ' |',
+    `| ${label} | ${baselineRuns?.length ?? '—'} / ${runs.length} | ${old ? seconds(old.load) + ' → ' : ''}${seconds(current.load)} | ${old ? seconds(old.task) + ' → ' : ''}${seconds(current.task)} | ${old ? number(old.heap) + ' → ' : ''}${number(current.heap)} MiB |`,
   );
 }
-const link = (label, file) =>
-  '[' + label + '](' + path.join(root, file).replaceAll('\\', '/') + ')';
-const good = alignments
-  .filter(r => r.variant === 'after')
-  .flatMap(r => r.marks);
-const optional = name =>
-  fs.existsSync(path.join(root, name)) ? read(name) : undefined;
-const interactions = optional('interactions-optimized.json');
-const shuffled = optional('shuffled-optimized.json');
-const last = comparisons.at(-1);
+const runs = after.results;
+const values = field => {
+  const recorded = [...new Set(runs.map(r => r[field]).filter(v => v != null))];
+  return recorded.length ? recorded.join(', ') : 'not recorded';
+};
 const lines = [
-  '# Trace waterfall optimization validation',
+  '# Trace waterfall benchmark',
   '',
-  'Validated 15 November 2026 (Australia/Sydney), against commit ' +
-    after.environment.commit +
-    ' plus the working-tree optimization.',
+  `Report generated: ${new Date().toISOString()}.`,
+  `Measurements recorded: ${after.environment?.recordedAt ?? 'not recorded'}.`,
+  `Benchmark revision: ${after.environment?.commit ?? 'not recorded'}; working tree: ${after.environment?.workingTreeDirty === undefined ? 'not recorded' : after.environment.workingTreeDirty ? 'modified' : 'clean'}.`,
   '',
-  '## Outcome',
+  '## Measurements',
   '',
-  'Initial loading is faster, and the measured multi-second main-thread stalls have been reduced to sub-second tasks. The largest fixture improved by ' +
-    last.loadReductionPercent.toFixed(1) +
-    '% in load time and ' +
-    last.longestTaskReductionPercent.toFixed(1) +
-    '% in longest-task duration. Memory remains high because all queried attributes/events are still retained.',
+  before
+    ? 'Baseline comparisons use matching fixture settings and recorded browser/CPU/mode values.'
+    : 'No baseline supplied. Collect performance-results.json on the baseline revision to enable comparisons.',
   '',
-  '## Results',
+  ...outcomes,
   '',
-  'Medians of three fresh browser contexts per scenario. All runs render 30 virtual rows and one canvas without JavaScript exceptions. The total row count is split evenly across the before/after query windows.',
-  '',
-  '| Spans | Logs | Initial load: before → after | Longest task: before → after | Post-paint heap: before → after |',
-  '| ---: | ---: | ---: | ---: | ---: |',
+  '| Fixture | Runs: baseline / current | Median initial load | Median longest task | Median post-paint JS heap |',
+  '| --- | ---: | ---: | ---: | ---: |',
   ...tables,
   '',
-  '## Changes',
+  `Runs: ${runs.length}. Rendered rows: ${values('renderedRows')}. Canvases: ${values('canvasCount')}.`,
+  errorSummary(runs),
   '',
-  '- Prepare each query window once, including when the peer window arrives first with equivalent metadata.',
-  '- Preserve SQL row identities while replacing the lodash omission path and preparing rows in cancellable chunks.',
-  '- Parse ISO timestamps once; keep seconds and nanoseconds separately for exact stable ordering and cache millisecond positions. Legacy formats retain timestamp-nano behavior.',
-  '- Sort bounded runs and merge cooperatively; build and flatten the tree cooperatively. Flattening reuses nodes and their precomputed depths.',
-  '- Resolve semantic colors once per status/service per timeline batch.',
-  '- Paint large minimaps in cancellable chunks. Selection remains an independent overlay.',
-  '- Discard cancelled jobs and release superseded prepared arrays. Traces of at most 1,000 rows keep a synchronous path.',
+  '## Recorded interaction checks',
   '',
-  '## Verification',
-  '',
-  '- Six targeted Jest suites: 175 tests passed. A final scheduler/canvas run passed all 20 tests after the cleanup/type fixes.',
-  '- TypeScript tsc --noEmit passed.',
-  '- Required repository lint:fix passed across four projects; existing warnings, no errors.',
-  '- First/middle/last minimap selections passed in both themes at DPR 1 and 2. Maximum alignment error: ' +
-    Math.max(...good.map(m => Math.abs(m.errorY))).toFixed(3) +
-    ' CSS pixels.',
-  interactions
-    ? '- Browser: collapsed, expanded, and selected in the 800,000-row fixture. Selection repainted the base canvas ' +
-      interactions.results[0].interactions.selectionCanvasDraws +
-      ' times.'
-    : '- Browser interaction checks pending.',
-  shuffled
-    ? '- Shuffled 200,000-span responses: ' +
-      (shuffled.results[0].initialLoadMs / 1000).toFixed(2) +
-      's initial load, ' +
-      shuffled.results[0].longestTaskMs.toFixed(0) +
-      'ms longest task, no exceptions.'
-    : '- Shuffled-response check pending.',
+];
+const alignments = read('alignment-results.json');
+const marks =
+  alignments?.filter(r => r.variant === 'after').flatMap(r => r.marks) ?? [];
+if (
+  marks.length &&
+  marks.every(m => Number.isFinite(m.errorY) && Number.isFinite(m.errorHeight))
+) {
+  const failed = marks.filter(
+    m => Math.abs(m.errorY) > 0.03 || Math.abs(m.errorHeight) > 0.03,
+  ).length;
+  lines.push(
+    `Alignment samples: ${marks.length}; outside 0.03 CSS pixels: ${failed}; maximum vertical error: ${Math.max(...marks.map(m => Math.abs(m.errorY))).toFixed(3)} CSS pixels.`,
+  );
+} else lines.push('Complete alignment measurements were not supplied.');
+const interactions = read('interactions-optimized.json');
+if (interactions?.results?.length) {
+  for (const run of interactions.results) {
+    const check = run.interactions ?? {};
+    lines.push(
+      `- ${run.scenario.spans} spans / ${run.scenario.logs} logs: collapse=${check.collapse ?? 'not recorded'}, expand=${check.expand ?? 'not recorded'}, selection=${check.selection ?? 'not recorded'}, viewport preserved=${check.viewportPreserved ?? 'not recorded'}, selection canvas draws=${check.selectionCanvasDraws ?? 'not recorded'}.`,
+    );
+  }
+} else lines.push('Interaction measurements were not supplied.');
+lines.push(
   '',
   '## Method and limits',
   '',
-  'Headless Microsoft Edge ' +
-    after.environment.browser +
-    ', production React, 1440×900, no CPU or network throttling. CPU: ' +
-    after.environment.cpu.trim() +
-    '; ' +
-    after.environment.logicalCpus +
-    ' logical CPUs; ' +
-    after.environment.memoryGiB.toFixed(1) +
-    ' GiB RAM.',
+  `Browser: ${after.environment?.browser ?? 'not recorded'}; CPU: ${after.environment?.cpu?.trim() ?? 'not recorded'}; mode: ${after.environment?.mode ?? 'not recorded'}.`,
+  `Browser trace hook: ${after.environment?.browserTraceHook ?? 'coverage not recorded'}.`,
   '',
-  'The fixtures include six attributes per trace (including a unique ID and a 512-character payload), two span events per trace, two services, errors, 1,000-span groups, and correlated logs. Trace compact JSON averages about 1,044 bytes per row. These are synthetic tests, not measurements of production traces.',
+  'This synthetic benchmark measures the production React waterfall, buffered decoder, row identities, preparation, minimap paint, and visible rows. SQL execution, production network/compression, authentication, metadata lookups, and application startup are excluded.',
   '',
-  'The actual container, buffered query decoder/TanStack cache, row-ID generation, browser-context detection scan, timestamps, tree/model, canvas, and virtualization run in the browser. Only SQL rendering, external lookups/transport, filter URL state, and peripheral UI are substituted. SQL execution, production network/compression, app startup, and bundle downloads are excluded. Timing ends after the complete canvas paint and two animation frames.',
+  'Heap measurements include collectible garbage unless the memory mode explicitly reports a value after collection. These are JavaScript heap measurements, not process memory. Input runs with exceptions or incomplete instrumentation should be investigated before drawing performance conclusions.',
   '',
-  'Heap values are post-paint used JS heap, without forced collection. They include collectible garbage and represent neither retained heap nor a sampled peak. The remaining sub-second tasks can still cause brief jank; loading the largest fixture still takes seconds. Reducing payload volume or moving decoding to a worker would require a separate change with its own data/selection tests.',
+  'The report summarizes supplied browser results. External test and lint checks require their own logs.',
   '',
-  '## Reproduce and inspect',
+  '## Source artifacts',
   '',
-  'Run the commands in ' +
-    link(
-      'benchmark README',
-      '../../scripts/benchmarks/trace-waterfall/README.md',
-    ) +
-    '. Reusable source scripts live under scripts/benchmarks/trace-waterfall; generated output stays in the ignored artifacts/trace-waterfall directory.',
-  '',
-  'Measurements: ' +
-    link('baseline', 'performance-results.json') +
-    ', ' +
-    link('optimized', 'performance-optimized.json') +
-    ', ' +
-    link('alignment', 'alignment-results.json') +
-    ', ' +
-    link('shuffled', 'shuffled-optimized.json') +
-    ', ' +
-    link('interactions', 'interactions-optimized.json') +
-    '.',
-  '',
-  '![Aligned minimap](' +
-    path.join(root, 'alignment-after-dark-dpr1.png').replaceAll('\\', '/') +
-    ')',
-];
+  `[Benchmark instructions](${path.join(repo, 'scripts/benchmarks/trace-waterfall/README.md').replaceAll('\\', '/')})`,
+);
+for (const name of [
+  'performance-results.json',
+  'performance-optimized.json',
+  'alignment-results.json',
+  'interactions-optimized.json',
+  'shuffled-optimized.json',
+]) {
+  if (fs.existsSync(path.join(root, name)))
+    lines.push(`- [${name}](${path.join(root, name).replaceAll('\\', '/')})`);
+}
 fs.writeFileSync(path.join(root, 'REPORT.md'), lines.join('\n') + '\n');
 fs.writeFileSync(
   path.join(root, 'comparison.json'),

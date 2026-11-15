@@ -46,6 +46,12 @@ const logSource = {
   traceIdExpression: 'TraceId',
   spanIdExpression: 'SpanId',
   bodyExpression: 'Body',
+  ...(parameters.get('browserTrace') === '1'
+    ? {
+        eventNameExpression: 'EventName',
+        eventAttributesExpression: 'LogAttributes',
+      }
+    : {}),
   severityTextExpression: 'SeverityText',
   serviceNameExpression: 'ServiceName',
   highlightedTraceAttributeExpressions: [{ sqlExpression: 'ServiceName' }],

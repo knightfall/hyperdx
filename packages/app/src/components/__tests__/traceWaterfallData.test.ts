@@ -13,7 +13,11 @@ import {
   TRACE_WATERFALL_FETCH_LIMIT,
   TRACE_WATERFALL_ROW_LIMIT,
 } from '@/components/traceWaterfallLimits';
-import { getWaterfallTimelineRows } from '@/components/traceWaterfallModel';
+import {
+  createWaterfallView,
+  getWaterfallTimelineRows,
+} from '@/components/traceWaterfallModel';
+import { finishWaterfallTask } from '@/components/waterfallTask';
 
 const row = (id: string, ParentSpanId = '', hidden = false) => ({
   id,
@@ -164,4 +168,40 @@ it('sorts shuffled chunks stably and yields before the full sort completes', () 
     (a, b) => Date.parse(a.Timestamp) - Date.parse(b.Timestamp),
   );
   expect(result.value).toEqual(expected);
+});
+
+it('prepares matching visible rows and timeline positions as one immutable view', () => {
+  const start = Date.UTC(2024, 0, 1);
+  const rows = Array.from({ length: 1002 }, (_, i) => ({
+    ...row(String(i), i % 10 === 0 ? '' : String(Math.floor(i / 10) * 10)),
+    Timestamp: new Date(start + i).toISOString(),
+    Duration: 0.001,
+    aliasWith: [],
+  }));
+  const tree = buildWaterfallTree(rows, new Set(rows.map(row => row.SpanId)));
+  Object.defineProperty(tree.rootNodes[0], 'Body', {
+    get() {
+      throw Error('Off-screen body read');
+    },
+  });
+  const collapsed = new Set(['0']);
+  const colors = new Map<string, string>();
+  const view = finishWaterfallTask(
+    createWaterfallView(tree, collapsed, start, colors, true, true),
+  );
+  expect(view.tree).toBe(tree);
+  expect(view.collapsedIds).toBe(collapsed);
+  expect(view.visibleNodes).toHaveLength(993);
+  expect(view.timelineRows.map(row => row.id)).toEqual(
+    view.visibleNodes.map(row => row.id),
+  );
+  expect(view.visibleNodes[1].id).toBe('10');
+  expect(view.timelineRows[1].events[0].start).toBe(10);
+  const hidden = finishWaterfallTask(
+    createWaterfallView(tree, collapsed, start, colors, false, true),
+  );
+  expect(hidden.visibleNodes).toEqual([]);
+  expect(hidden.timelineRows).toEqual([]);
+  expect(hidden.flattenedCount).toBe(993);
+  expect(tree.rootNodes[0].children).toHaveLength(9);
 });

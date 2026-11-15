@@ -48,6 +48,12 @@ const HandleGrip = ({ side }: { side: 'left' | 'right' }) => (
   </div>
 );
 
+// Persistent pointer callbacks share their render's closure context. Keep the
+// large rows array in a separate hook scope so those callbacks cannot retain it.
+function useMinimapMaxValue(rows: MinimapRow[]) {
+  return useMemo(() => getMaxEventValue(rows), [rows]);
+}
+
 export const TimelineMinimap = memo(function ({
   rows,
   controller,
@@ -91,7 +97,7 @@ export const TimelineMinimap = memo(function ({
     return controller.subscribe(update);
   }, [controller]);
 
-  const maxVal = useMemo(() => getMaxEventValue(rows), [rows]);
+  const maxVal = useMinimapMaxValue(rows);
 
   const viewportStartFrac = viewport.offsetFrac;
   const viewportWidthFrac = viewport.widthFrac;

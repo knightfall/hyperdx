@@ -1,3 +1,4 @@
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { SourceMap } = require('node:module');
@@ -74,7 +75,11 @@ exports.startMemoryRecording = async (
       );
     }, 20);
   });
+  let beforeInteractions;
   return {
+    captureBeforeInteractions: async () => {
+      beforeInteractions = await measure();
+    },
     finish: async () => {
       const peakMiB = await page.evaluate(() => {
         clearInterval(window.__heapTimer);
@@ -84,6 +89,14 @@ exports.startMemoryRecording = async (
         );
       });
       const loaded = await measure();
+      const interactionGrowthMiB = beforeInteractions
+        ? loaded.retainedMiB - beforeInteractions.retainedMiB
+        : undefined;
+      // Allow fixed UI/JIT overhead and 32 bytes per row, but catch retention of
+      // a second full timeline (row/event objects cost substantially more).
+      const interactionBudgetMiB = beforeInteractions
+        ? 5 + ((scenario.spans + scenario.logs) * 32) / 1048576
+        : undefined;
       let allocations;
       if (repetition === 1) {
         const { profile } = await session.send('HeapProfiler.stopSampling');
@@ -116,7 +129,10 @@ exports.startMemoryRecording = async (
       const unmounted = await measure();
       await page.evaluate(() => window.__queryClient.clear());
       const cleared = await measure();
-      return {
+      const result = {
+        beforeInteractions,
+        interactionGrowthMiB,
+        interactionBudgetMiB,
         startup,
         peakMiB,
         loaded,
@@ -125,6 +141,21 @@ exports.startMemoryRecording = async (
         queryRows,
         allocations,
       };
+      if (beforeInteractions) {
+        fs.writeFileSync(
+          path.join(root, 'interaction-memory-check.json'),
+          JSON.stringify(result, null, 2),
+        );
+        assert.ok(
+          interactionGrowthMiB <= interactionBudgetMiB,
+          'Interactions retained ' +
+            interactionGrowthMiB.toFixed(2) +
+            ' MiB; budget ' +
+            interactionBudgetMiB.toFixed(2) +
+            ' MiB',
+        );
+      }
+      return result;
     },
   };
 };
